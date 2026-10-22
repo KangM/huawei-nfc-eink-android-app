@@ -25,8 +25,14 @@
 判读：
     REFRESH_DONE           见到忙/忙态之后连续三次空闲 ⇒ 驱动板报告刷新结束，请目视核对画面
     HELD_ALL_BUSY          全程都是 68CA/C6/CB，一次 9000 都没有 ⇒ 屏始终没结束刷新
-    IDLE_NO_BUSY           一直空闲但从未见到忙 ⇒ 没有在这段时间里启动过刷新
+    IDLE_NO_BUSY           一直空闲但从未见到忙 ⇒ 刷新命令没有被接受（D4 也没拿到 9000 时会自动重发）
     ABORTED_*              出现其它状态字，按真实错误处理（那才是需要查固件/接线的情况）
+
+D4 回包丢失的处理（2026-10-22 18:25 实测后补）：
+    波形一起，最耗电的那一刻，回包经常在电压塌陷时丢掉，报成 RF_TIMEOUT。
+    「没有回包」不等于「没收到命令」，所以本脚本先开 8 秒小窗口问 DE：
+      · 见到忙   ⇒ 命令其实已被接受，不再重发（重发会打断波形），继续等它刷完
+      · 一直空闲 ⇒ 命令真的没被接住，重发 D4（--d4-retries，默认 2 次）
 """
 
 from __future__ import annotations
@@ -59,8 +65,22 @@ def sw_text(sw: int) -> str:
     return SW_TEXT.get(sw, "未知状态字")
 
 
+def d4_retry_allowed(*, d4_ok: bool, quick: dict, attempt: int, retries: int) -> bool:
+    """D4 回包丢了之后，能不能安全地再发一次。
+
+    只有同时满足三条才允许重发：① 还有重试额度 ② 上一段观察里一次忙态都没有
+    ③ D4 没拿到明确的 9000。第 ② 条是安全阀：板子若已经在刷，重发 D4 会打断波形。
+    """
+    if attempt > retries:
+        return False
+    if d4_ok:
+        return False
+    return quick.get("outcome") == "IDLE_NO_BUSY" and not quick.get("busy_seen")
+
+
 def hold_poll(poll, now, pause, *, duration: float, first_delay: float, de_hz: float,
-              min_observation: float = MIN_OBSERVATION, max_link_errors: int = 5, report=print) -> dict:
+              min_observation: float = MIN_OBSERVATION, max_link_errors: int = 5,
+              initial_busy: bool = False, report=print) -> dict:
     """按住场反复查询 DE，把「忙」当成可以继续等，而不是错误。
 
     poll() -> (sw:int, data:bytes)；now() -> float 秒；pause(seconds)
@@ -73,7 +93,7 @@ def hold_poll(poll, now, pause, *, duration: float, first_delay: float, de_hz: f
     samples: list[tuple[float, int, bytes]] = []
     counts: dict[int, int] = {}
     outcome, detail = "TIMEOUT", ""
-    busy_seen = False
+    busy_seen = initial_busy
     idle = 0
     link_errors = 0
     if first_delay > 0:
@@ -190,42 +210,90 @@ def real(args) -> int:
 
 def _hold_factory(base, settings, logger, args, **kw):
     device = base(settings, logger, **kw)
-    device.args_no_d4 = args.no_d4
 
     def observe(job, *, timeout=None):
         duration = float(timeout if timeout is not None else job.timeout)
         device.begin_stage("刷新", "启动刷新并按住射频场，遇到忙态不放弃...")
-        lost_reply = False
-        if not args.no_d4:
-            try:
-                result = device.exchange(f"{job.name} D4", job.d4,
-                                         timeout=min(settings.d4_timeout, duration), require_ok=False)
-            except Exception as exc:
-                # D4 是全场最耗电的一步：波形一起，回包常在电压塌陷时丢掉。
-                # 「没有回包」不等于「没收到命令」—— 去问 DE 才知道板子到底动没动。
-                lost_reply = True
-                device.report(f"D4 没有回包（{exc}）；不能断定命令没被接受，继续观察 DE。", level="warning")
-            else:
-                device.report(f"D4 返回 SW={result.sw:04X} {sw_text(result.sw)}",
-                              level="success" if result.sw == 0x9000 else "warning")
-                if result.sw != 0x9000 and result.sw not in BUSY_SW:
-                    result.require_ok("D4")
-                if result.sw in BUSY_SW:
-                    device.report("D4 也报忙：不重发（重发可能打断已开始的波形），直接进 DE 观察。", level="warning")
-        device.report(f"观察窗口 {duration:g} 秒，DE 查询 {settings.de_hz:g} Hz。", detail=False)
 
         def poll():
             reply = device.exchange(f"{job.name} DE", DE, timeout=min(settings.de_timeout, 5.0),
                                     quiet=True, require_ok=False)
             return reply.sw, reply.data
 
-        outcome = hold_poll(poll, device.clock, device.sleep, duration=duration,
-                            first_delay=settings.first_de_delay_ms / 1000.0, de_hz=settings.de_hz,
-                            report=lambda line: device.report(line, detail=False))
-        outcome["d4_reply_lost"] = lost_reply
+        def report(line):
+            device.report(line, detail=False)
+
+        collected: list[tuple[float, int, bytes]] = []
+        offset = [0.0]
+
+        def window(span, first_delay, min_obs, initial_busy=False):
+            res = hold_poll(poll, device.clock, device.sleep, duration=max(0.2, span),
+                            first_delay=first_delay, de_hz=settings.de_hz,
+                            min_observation=min_obs, initial_busy=initial_busy, report=report)
+            for t, sw, data in res["samples"]:
+                collected.append((t + offset[0], sw, data))
+            offset[0] += res["elapsed"]
+            return res
+
+        # ---- 第一步：发 D4（或在 --no-d4 时跳过），并用 8 秒小窗口快速判定它有没有被接受
+        attempt, lost_reply, d4_ok = 1, False, False
+        while True:
+            if args.no_d4:
+                d4_ok = True
+            else:
+                try:
+                    result = device.exchange(f"{job.name} D4", job.d4,
+                                             timeout=min(settings.d4_timeout, max(8.0, duration)),
+                                             require_ok=False)
+                except Exception as exc:
+                    # D4 是全场最耗电的一步：波形一起，回包常在电压塌陷时丢掉。
+                    # 「没有回包」不等于「没收到命令」—— 去问 DE 才知道板子到底动没动。
+                    lost_reply = True
+                    device.report(f"第 {attempt} 次 D4 没有回包（{exc}）；不能断定命令没被接受，继续问 DE。",
+                                  level="warning")
+                else:
+                    device.report(f"第 {attempt} 次 D4 返回 SW={result.sw:04X} {sw_text(result.sw)}",
+                                  level="success" if result.sw == 0x9000 else "warning")
+                    d4_ok = result.sw == 0x9000
+                    if result.sw != 0x9000 and result.sw not in BUSY_SW:
+                        result.require_ok("D4")
+                    if result.sw in BUSY_SW:
+                        device.report("D4 也报忙：不重发（重发可能打断已开始的波形），直接进 DE 观察。",
+                                      level="warning")
+                        d4_ok = True
+            report(f"第 {attempt} 次观察：先看 8 秒里板子有没有报忙。")
+            quick = window(min(8.0, max(3.0, duration)), 0.5, 0.0)
+            if quick["busy_seen"] or quick["outcome"] != "IDLE_NO_BUSY":
+                break
+            if not d4_retry_allowed(d4_ok=d4_ok, quick=quick, attempt=attempt, retries=args.d4_retries):
+                break
+            device.report("板子 8 秒一直空闲、D4 又没拿到 9000 ⇒ 刷新命令没被接受，重发一次 D4。",
+                          level="warning")
+            attempt += 1
+
+        # ---- 第二步：如果已经看到忙，就把剩下的窗口用来等它刷完
+        busy_any = quick["busy_seen"] or any(sw in BUSY_SW for sw in quick["counts"])
+        if busy_any:
+            rest = duration - offset[0]
+            if rest > 1.0:
+                device.report(f"已看到忙态；继续供能观察剩余 {rest:.0f} 秒。")
+                final = window(rest, 0.0, 0.0, initial_busy=True)
+            else:
+                final = quick
+        else:
+            final = quick
+        if quick is not final:
+            for key, value in quick["counts"].items():
+                final["counts"][key] = final["counts"].get(key, 0) + value
+        outcome = {"outcome": final["outcome"], "detail": final["detail"],
+                   "samples": collected, "counts": final["counts"],
+                   "busy_seen": busy_any or final["busy_seen"],
+                   "elapsed": offset[0], "d4_attempts": attempt, "d4_reply_lost": lost_reply}
+        device.log.event("refresh_hold", {k: v for k, v in outcome.items() if k != "samples"})
         if lost_reply and outcome["outcome"] in ("HELD_ALL_BUSY", "REFRESH_DONE"):
             outcome["detail"] += "；D4 回包虽丢，但板子随后报告过忙 ⇒ 刷新命令其实已被接受"
-        device.log.event("refresh_hold", {k: v for k, v in outcome.items() if k != "samples"})
+        if lost_reply and outcome["outcome"] == "IDLE_NO_BUSY":
+            outcome["detail"] += f"；共发了 {attempt} 次 D4，板子始终空闲 ⇒ 刷新命令没有被接收，问题在 D4 这一步"
         device.report(f"{outcome['outcome']} · {outcome['detail']}",
                       level="success" if outcome["outcome"] == "REFRESH_DONE" else "warning", detail=False)
         write_csv(Path("logs") / "refresh-hold.csv", outcome)
@@ -318,6 +386,27 @@ def selftest() -> int:
                     duration=2, first_delay=99, de_hz=1000, report=lambda *_: None)
     checks.append(("first_delay 不会越过 deadline", res["elapsed"] <= 2.5))
 
+    # 10) D4 回包丢失后的重发决策：只有「空闲 + 没拿到 9000 + 还有额度」才允许
+    idle = {"outcome": "IDLE_NO_BUSY", "busy_seen": False}
+    busy = {"outcome": "TIMEOUT", "busy_seen": True}
+    checks.append(("D4 丢包 + 板子空闲 ⇒ 允许重发",
+                   d4_retry_allowed(d4_ok=False, quick=idle, attempt=1, retries=2)))
+    checks.append(("D4 已 9000 ⇒ 不重发",
+                   not d4_retry_allowed(d4_ok=True, quick=idle, attempt=1, retries=2)))
+    checks.append(("板子已报忙 ⇒ 绝不重发",
+                   not d4_retry_allowed(d4_ok=False, quick=busy, attempt=1, retries=2)))
+    checks.append(("额度用尽 ⇒ 不重发",
+                   not d4_retry_allowed(d4_ok=False, quick=idle, attempt=3, retries=2)))
+    checks.append(("链路已断 ⇒ 不重发",
+                   not d4_retry_allowed(d4_ok=False, quick={"outcome": "ABORTED_LINK", "busy_seen": False},
+                                        attempt=1, retries=2)))
+
+    # 11) initial_busy 让「先忙过」的状态跨窗口保留
+    clock = [0.0]
+    res = hold_poll(scripted([(0x9000, b"\x00")] * 5, clock), lambda: clock[0], lambda s: None,
+                    duration=10, first_delay=0, de_hz=1000, initial_busy=True, report=lambda *_: None)
+    checks.append(("initial_busy 让纯空闲也算 REFRESH_DONE", res["outcome"] == "REFRESH_DONE"))
+
     ok = sum(1 for _, passed in checks if passed)
     for name, passed in checks:
         print(("  PASS  " if passed else "  FAIL  ") + name)
@@ -341,6 +430,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--precharge-ms", type=float, default=1000.0)
     p.add_argument("--pre-refresh-ms", type=float, default=1000.0)
     p.add_argument("--no-d4", action="store_true", help="只观察，不重发 D4")
+    p.add_argument("--d4-retries", type=int, default=2,
+                   help="D4 回包丢失且板子始终空闲时，最多重发几次（默认 2；板子一旦报忙就不再重发）")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--verbose", action="store_true")
     return p
