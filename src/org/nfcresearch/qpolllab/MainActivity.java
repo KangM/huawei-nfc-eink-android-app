@@ -66,7 +66,30 @@ public final class MainActivity extends Activity {
     private boolean scanning,terminal;
     private android.nfc.NfcAdapter foregroundAdapter;
     private volatile boolean foregroundScan,foregroundHit;
-    private final Runnable foregroundTimeout=new Runnable(){public void run(){stopForegroundScan("本轮超时，未收到标签");}};
+    private int foregroundStage,foregroundStageSeconds;
+    private android.app.PendingIntent dispatchIntent;
+    /** Four ways to register for tag discovery, tried in order. If none of them sees a plain tag,
+     *  the problem is the tag / the antenna / the ROM -- not this app. A negative value means the
+     *  legacy enableForegroundDispatch() path. */
+    private static final int[] FOREGROUND_STAGES={
+            android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_NFC_B
+                    |android.nfc.NfcAdapter.FLAG_READER_NFC_F|android.nfc.NfcAdapter.FLAG_READER_NFC_V
+                    |android.nfc.NfcAdapter.FLAG_READER_NFC_BARCODE|android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+            android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_NFC_B
+                    |android.nfc.NfcAdapter.FLAG_READER_NFC_F|android.nfc.NfcAdapter.FLAG_READER_NFC_V
+                    |android.nfc.NfcAdapter.FLAG_READER_NFC_BARCODE,
+            android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+            -1};
+    private static final String[] FOREGROUND_LABELS={
+            "全技术（A/B/F/V/Barcode）+ 跳过 NDEF 检查",
+            "全技术（A/B/F/V/Barcode），先让系统做 NDEF 检查",
+            "仅 NFC-A + 跳过 NDEF 检查（此前的写法）",
+            "传统 enableForegroundDispatch（PendingIntent）"};
+    private final Runnable foregroundTimeout=new Runnable(){public void run(){
+        if(!foregroundScan||foregroundHit)return;
+        foregroundStage++;
+        runForegroundStage();
+    }};
     /** Combo experiment: worker (UID 2000) only switches QTag on, this foreground Activity polls. */
     private volatile boolean comboMode,comboStarted;
     private int comboSeconds;
@@ -109,7 +132,7 @@ public final class MainActivity extends Activity {
         duration=spinner(new String[]{"寻卡 5 秒","寻卡 10 秒","寻卡 30 秒","寻卡 60 秒"});duration.setSelection(1);page.addView(duration);
         page.addView(action("测试 Q-Poll 能力",v->start("qtag")));page.addView(action("普通 NFC-A 对照",v->start("standard")));
         page.addView(action("前台 ReaderMode 对照（应用进程）",v->startForegroundScan()));
-        page.addView(text("上一项由后台进程调用系统接口；本项改由应用自身进程调用同样的接口。两者对照，可判别后台调用是否被系统忽略。",12,0xff68766e));
+        page.addView(text("上一项由后台进程调用系统接口；本项改由应用自身进程调用，并依次尝试四种注册方式（全技术 / 不跳 NDEF / 仅 NFC-A / 传统 foregroundDispatch）。四种都读不到普通卡，就说明问题不在本应用。",12,0xff68766e));
         page.addView(action("组合测试：QTag + 前台寻卡",v->startCombo()));
         page.addView(text("组合测试把两件事分别交给合适的进程：后台特权进程只负责开启 QTag（Q-Poll 开关），寻卡由本应用前台进程执行。这是绕开「后台调用被系统忽略」的正解。",12,0xff68766e));
         page.addView(action("QTag 命令探测（只读扫参）",v->start("qtag-sweep")));
@@ -169,10 +192,10 @@ public final class MainActivity extends Activity {
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
         page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
-        page.addView(text("墨水屏刷新测试 · v2.13-combo-test4",12,0xff68766e));
+        page.addView(text("墨水屏刷新测试 · v2.13-combo-test5",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
         selectPage(getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("page",0));
-        append("v2.13-combo-test4 就绪；缺少厂商 NCI 通道时改为明确报告，不再以堆栈结束。");source=PanelImage.testPattern();originalSource=source;prepare();
+        append("v2.13-combo-test5 就绪；前台寻卡改为四种注册方式逐段对照，用来定位「普通卡也读不到」。");source=PanelImage.testPattern();originalSource=source;prepare();
     }
     private void section(LinearLayout page,String title){TextView t=text(title,18,0xff142f2a);t.setTypeface(null,Typeface.BOLD);t.setPadding(0,dp(12),0,dp(6));page.addView(t);}
     private void selectPage(int index){activePage=Math.max(0,Math.min(2,index));for(int i=0;i<3;i++){pageScrolls[i].setVisibility(i==activePage?View.VISIBLE:View.GONE);tabs[i].setTextColor(i==activePage?Color.WHITE:0xff52635d);tabs[i].setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==activePage?0xff176b61:0xffe3eae6));}getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("page",activePage).apply();}
@@ -318,34 +341,87 @@ public final class MainActivity extends Activity {
     private static byte[] readFile(File file)throws IOException {byte[] bytes=new byte[(int)file.length()];try(DataInputStream in=new DataInputStream(new FileInputStream(file))){in.readFully(bytes);}return bytes;}
     private void cancelBridge()throws Exception {android.os.IBinder binder=bridgeBinder;if(binder==null)return;Parcel request=Parcel.obtain(),reply=Parcel.obtain();try{request.writeInterfaceToken("org.nfcresearch.qpolllab.NfcSession");binder.transact(3,request,reply,0);reply.readException();}finally{request.recycle();reply.recycle();}}
     /** Same reader mode, but called from this process, which has a resumed Activity: since Android 12
-     *  NfcService silently ignores setReaderMode() from UID 2000 unless the caller is foreground or system. */
+     *  NfcService silently ignores setReaderMode() from UID 2000 unless the caller is foreground or system.
+     *  It then walks through the registration variants, so a blank result tells us *which* layer is deaf. */
     private void startForegroundScan(){
         if(busy||preparing||editingCrop||!resumed)return;
         comboMode=false;comboStarted=false;main.removeCallbacks(comboTimeout);
         final int seconds=durations[duration.getSelectedItemPosition()];
         busy=true;foregroundScan=true;foregroundHit=false;terminal=false;controls();progress.setProgress(0);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        append("──────── foreground · 前台 ReaderMode 对照 "+seconds+" 秒 ────────");
+        append("──────── foreground · 前台 ReaderMode 多方案对照 ────────");
+        foregroundAdapter=android.nfc.NfcAdapter.getDefaultAdapter(this);
+        if(foregroundAdapter==null){
+            append("FRAMEWORK · 本机没有可用的 NFC 适配器。");
+            busy=false;foregroundScan=false;controls();getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            return;
+        }
+        foregroundStage=0;
+        foregroundStageSeconds=Math.max(4,seconds/2);
+        boolean granted=checkSelfPermission("android.permission.NFC")==android.content.pm.PackageManager.PERMISSION_GRANTED;
+        append("FRAMEWORK · 调用方 UID="+android.os.Process.myUid()+"，Activity 处于前台；NFC 已启用="
+                +foregroundAdapter.isEnabled()+"；NFC 权限="+(granted?"已授予":"未授予"));
+        append("FRAMEWORK · 依次尝试 "+FOREGROUND_STAGES.length+" 种注册方式，每段 "+foregroundStageSeconds
+                +" 秒，收到标签即停止。若四种都收不到，问题不在本应用。");
+        event("QP|START|foreground:"+seconds);
+        state.setText("前台 ReaderMode 对照");
+        detail.setText("先把标签抬离；每段提示后再贴回感应区。");
+        runForegroundStage();
+    }
+    private void runForegroundStage(){
+        if(destroyed||!foregroundScan||foregroundAdapter==null)return;
+        main.removeCallbacks(foregroundTimeout);
+        if(foregroundStage>=FOREGROUND_STAGES.length){
+            stopForegroundScan("四种注册方式都没收到标签：先换一张普通卡验证感应区，再看系统是否给出提示");
+            return;
+        }
+        try{foregroundAdapter.disableReaderMode(this);}catch(Throwable ignored){}
+        try{foregroundAdapter.disableForegroundDispatch(this);}catch(Throwable ignored){}
+        String label=FOREGROUND_LABELS[foregroundStage];
+        append("FRAMEWORK · 第 "+(foregroundStage+1)+"/"+FOREGROUND_STAGES.length+" 段："+label);
         try{
-            foregroundAdapter=android.nfc.NfcAdapter.getDefaultAdapter(this);
-            if(foregroundAdapter==null)append("FRAMEWORK · 本机没有可用的 NFC 适配器。");
-            else{
+            if(FOREGROUND_STAGES[foregroundStage]<0){
+                if(dispatchIntent==null){
+                    Intent intent=new Intent(this,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    int flags=android.os.Build.VERSION.SDK_INT>=31?android.app.PendingIntent.FLAG_MUTABLE:0;
+                    dispatchIntent=android.app.PendingIntent.getActivity(this,1,intent,flags);
+                }
+                foregroundAdapter.enableForegroundDispatch(this,dispatchIntent,null,null);
+            }else{
                 android.os.Bundle extras=new android.os.Bundle();
                 extras.putInt(android.nfc.NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY,250);
                 foregroundAdapter.enableReaderMode(this,tag->{
                     if(foregroundHit)return;
                     foregroundHit=true;
                     main.post(()->{if(destroyed)return;describeForegroundTag(tag);stopForegroundScan(null);});
-                },android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,extras);
-                append("FRAMEWORK · 由应用自身进程调用系统 ReaderMode：调用方 UID="+android.os.Process.myUid()+"，Activity 处于前台。");
-                event("QP|START|foreground:"+seconds);
-                state.setText("前台 ReaderMode 对照");
-                detail.setText("先把标签抬离；出现 START 后再贴回，"+seconds+" 秒内有效。");
-                main.postDelayed(foregroundTimeout,seconds*1000L);
-                return;
+                },FOREGROUND_STAGES[foregroundStage],extras);
             }
-        }catch(Throwable e){append("FRAMEWORK · 启用 ReaderMode 失败："+e);}
-        busy=false;foregroundScan=false;controls();getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }catch(Throwable e){
+            append("FRAMEWORK · 第 "+(foregroundStage+1)+" 段注册失败："+e);
+            foregroundStage++;
+            main.post(this::runForegroundStage);
+            return;
+        }
+        main.postDelayed(foregroundTimeout,foregroundStageSeconds*1000L);
+    }
+    /** onNewIntent() is where enableForegroundDispatch() delivers its finds (the activity is singleTask). */
+    @Override protected void onNewIntent(Intent intent){
+        super.onNewIntent(intent);
+        if(intent==null||!foregroundScan||foregroundHit)return;
+        String action=intent.getAction();
+        if(!android.nfc.NfcAdapter.ACTION_TAG_DISCOVERED.equals(action)
+                &&!android.nfc.NfcAdapter.ACTION_NDEF_DISCOVERED.equals(action)
+                &&!android.nfc.NfcAdapter.ACTION_TECH_DISCOVERED.equals(action))return;
+        android.nfc.Tag tag=(android.nfc.Tag)intent.getParcelableExtra(android.nfc.NfcAdapter.EXTRA_TAG);
+        if(tag==null)return;
+        foregroundHit=true;
+        final android.nfc.Tag found=tag;
+        main.post(()->{
+            if(destroyed)return;
+            event("QP|FRAMEWORK|标签经传统 foregroundDispatch 送达，非 ReaderMode 通道");
+            describeForegroundTag(found);
+            stopForegroundScan(null);
+        });
     }
     private void describeForegroundTag(android.nfc.Tag tag){
         StringBuilder uid=new StringBuilder();
@@ -361,6 +437,7 @@ public final class MainActivity extends Activity {
         foregroundScan=false;
         main.removeCallbacks(foregroundTimeout);
         if(foregroundAdapter!=null)try{foregroundAdapter.disableReaderMode(this);}catch(Throwable ignored){}
+        if(foregroundAdapter!=null)try{foregroundAdapter.disableForegroundDispatch(this);}catch(Throwable ignored){}
         scanning=false;main.removeCallbacks(tick);
         if(!foregroundHit&&reason!=null){terminal=true;event("QP|RESULT|前台 ReaderMode 本轮结束："+reason);}
         busy=false;controls();
