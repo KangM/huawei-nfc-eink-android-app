@@ -73,6 +73,107 @@ adb install -r dist/QPollLab-2.10-test1.apk
 
 日志增加 CONNECT_ATTEMPT、ISO_DEP、CONNECTED / CONNECT_FAILED、APDU_BEGIN / APDU_FAILED 和异常堆栈；不记录 PIN 或图像内容。升级后重新连接 Shizuku，先执行“只读检查屏幕”，反馈从本轮开始到结束的完整日志及手机、系统、屏幕型号。此版本是连接恢复尝试与诊断增强，尚未在 Issue 中的目标屏实测，不代表已支持该型号。
 
+## Chameleon Ultra 只读交叉测试
+
+当手机端的 NCI 日志不可见、无法判断是轮询不兼容还是屏幕线圈问题时，可用 `tools/chameleon_probe.py` 绕开 Q-Poll 直接验证屏幕本身。该脚本只发 D1（可选 D8），不写图像、不触发刷新。
+
+需要 Chameleon **Ultra**（内含独立的 14a 读卡芯片；Lite 不支持）与 Python 3.9+：
+
+```sh
+pip install pyserial
+python tools/chameleon_probe.py selftest                 # 离线自检，不需要硬件
+python tools/chameleon_probe.py info    --port COM9      # 连接、固件版本、切读卡器模式
+python tools/chameleon_probe.py scan    --port COM9      # 仅标准轮询，结束后关闭场
+python tools/chameleon_probe.py probe   --port COM9      # 保持供能：激活 + RATS + D1
+python tools/chameleon_probe.py probe   --port COM9 --with-d8
+python tools/chameleon_probe.py survey  --port COM9 --repeat 20         # 单点应答率，用于比较贴合位置
+python tools/chameleon_probe.py survey  --port COM9 --repeat 10 --deep  # 每轮都跑完 RATS + D1
+```
+
+`survey` 重复同一套最简激活并记录命中率。移动读头或改变线圈形状只会改变耦合系数、不会改变协议，所以比较位置优劣应当比百分比而不是比手感：先在某个位置跑一次得到基准，改一处再跑一次，看 `SURVEY_RESULT` 的数字变化。零应答时先换一张已知正常的卡在同一位置复核，确认读卡器本身有效。
+
+脚本依次尝试标准 7 位短帧 `26`（REQA）/`52`（WUPA）与非标准 `7A`/`7D`：上游 solar2ain 的协议文档说明部分 FMSC / 华为驱动板是用 `7A`/`7D` 唤醒的。只试 `26`/`52` 时，这类板会表现为“完全无应答”，极易被误判成线圈损坏。
+
+### 已有 PN532 / PCR532 时的最短路径
+
+上游 solar2ain/ink-nfc-fmsc-by-pn532 直接支持 PN532 / PCR532 的 UART 串口模式，判定这块板能否被寻到不必自己写：
+
+本机实测可用的安装方式（隔离虚拟环境，不要装到系统 Python）：
+
+```powershell
+C:\Users\Chen\.workbuddy\binaries\python\versions\3.13.12\python.exe -m venv C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe -m pip install "git+https://github.com/solar2ain/ink-nfc-fmsc-by-pn532.git"
+```
+
+之后用**该虚拟环境**里的 Python 运行（版本 0.1.21 已验证可用，依赖含 Pillow / mini-racer / lzokay / pyserial）：
+
+```powershell
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe -m ink_nfc_fmsc ports
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe -m ink_nfc_fmsc probe --port COM14 --verbose
+```
+
+`ports` 列出读写器串口，典型 PN532 模块显示为 `USB-SERIAL CH340`；`probe` 只做连接检查，不改配置、不刷屏。加上 `--verbose` 会打印协议细节，`--json` 便于存档。`probe` 另有 `--board {auto,huawei,iphone}`、`--reader {auto,pn532,pcr532}`、`--uid`、`--rf-timeout-ms` 等参数：软件扫不到时可显式指定 `--board huawei`、`--reader pn532` 再试。
+
+**它是 GPL-3.0 工具，只作为外部诊断手段使用，不得作为本仓库的依赖或随 APK 分发。**
+
+- **不要省略 `--use-stored-driver`**：指定 `--screen` 而不带该参数会写入 DA / DB，**覆盖驱动板原厂配置且无法还原**。本仓库 App 从不发送 DB / DA，始终使用板内已存驱动。
+- **期望要放对**：上游实测 PN532 配小线圈时，华为 A0 / A1 在刷新启动后多次失联；唯一成功完成 A1 552×768 四色刷新的组合是 **PCR532 + Nova 15 Pro/Ultra 原配手机壳里藏在摄像头边框的原配大线圈 + `--use-stored-driver`**。所以 PN532 适合回答“这块板答不答应”，不要指望用它完成 552×768 的刷新。
+- **协议要点**：华为板在 D8 返回 `6985` 时需要验证一次已知默认 PIN 再复查 D8（本 App 已内置该步骤）；D4 = `F0 D4 85 80 00`；DE = `F0 DE 00 00 01`；为兼容 PN532 串口帧，ISO-DEP 的 INF 建议限制在 240 bytes。
+- **对照价值**：同一个线圈位置上，PN532 找得到而 Chameleon 找不到（或相反），差别就在轮询与唤醒帧，而不是线圈。这一组差异正是手机端“超时未收到标签”的候选解释。
+
+- 优先使用固件的 `HF14A_SCAN_KEEP`；不支持时回退到手动 REQA / 防碰撞 / SELECT / RATS 序列，全程 `-k` 保持射频场不断开，避免轮询间隙导致假阴性。
+- ISO14443-4（T=CL） blocks 与 WTX 处理在脚本内实现，固件不提供 APDU 层。
+- 输出为 `CP|类型|说明`，类型沿用 App 日志的 TAG / META / ISO_DEP / APDU / RESULT / ERROR，便于两份日志对照。
+- D1 回包按与原厂配置相同的字段逐项校验；不匹配只报告，不写入任何数据。
+- 未发出任何应答不等于屏幕损坏：请先用一张已知正常的卡执行同一命令校验读卡器，再更换贴合位置重试。供电能力有限，不建议用它尝试传图或刷新。
+- **线圈尺寸与折线圈**：耦合系数在两个环路尺寸接近时最大。屏幕线圈比 Chameleon 的天线大很多时，多围出来的面积基本是反向回磁通，正负相抵。把线圈对半平折会让折过去那一半的面积矢量反向、与剩下的一半互相抵消（净磁通趋近于零），同时电感骤降使谐振偏离 13.56 MHz，两个效应叠加通常**比不折更差**。优先尝试把读头整块压在线圈外框走线上（靠近导体的磁场最密，且不动线圈就不会失谐），并用 `survey` 逐点比较命中率。在两者之间加一个调谐到 13.56 MHz 的无源中继环，也能改善尺寸失配且不必改动任何一侧。
+- 该脚本仅重新实现了公开的串口帧结构；上游 ChameleonUltra 客户端为 GPL-3.0，未被包含或导入。协议部分同样遵循本仓库的非商业限制。
+
+## PN532 本机实测结论（2026-10-22）
+
+COM14（PN532 / USB-SERIAL CH340），工具版本 0.1.21。目标为**华为 Nova 墨水屏手机壳 NFC 驱动板**，UID `2E 6C 15 1E`，APPID `20 1E A0 01`。
+
+### 一、决定性结论：这块板不响应标准 REQA / WUPA
+
+`probe` 的 `--board` 决定尝试哪些 7 位唤醒短帧（`auto` = `26,52,7A,7D`；`iphone` = 仅 `26,52`；`huawei` = 仅 `7A,7D`），三种模式在同一位置重复验证：
+
+| 模式 | 尝试的帧 | 结果 |
+|---|---|---|
+| `auto` | `26`→`52`→`7A`→`7D` | 成功，`wake=7A / 7-bit`，D1=9000 |
+| `iphone` | `26`、`52` | 失败，`TAG_NOT_FOUND` |
+| `huawei` | `7A`、`7D` | 成功，`wake=7A / 7-bit`，D1=9000 |
+
+`auto` 是**先试标准帧**的，最终落在 `7A`，说明 `26`/`52` 确实没有应答。工具在激活前会先关场约 1.5 秒再开，并分别等待 5 ms 与 200 ms 各试一轮，两种等待都不影响结果。
+
+**由此得到 Android 侧的判定**：这块板只有收到非标准的 7 位短帧 `7A`（或 `7D`）才应答，而 Android 公开 API 无法发送 7 位短帧 —— `NfcA.transceive()` 官方文档明确写了"Applications must only send commands that are complete bytes, for example a SENS_REQ is not possible"，且 CRC 由栈自动附加。也就是说：
+
+- 手机"`本轮超时，未收到标签`"**不是轮询间隙掉电、也不是 Q-Poll 是否生效**的问题，而是**标准轮询压根发不出这块板要的那个帧**；
+- 调 polling 参数、换 discovery 类型（包括 Q-Poll）都不改变这一点，除非能走到厂商私有的"发送原始比特级帧"通道；
+- 一旦被 `7A` 唤醒之后，后续 SELECT / RATS / ISO-DEP / D1 全是标准流程 —— 所以 Chameleon 脚本（-k 保持场 + bitlen=7）和 PN532 都能通。缺的只是**唤醒那一下**。
+
+### 二、传图成功、刷新失败
+
+`send-test` 实测（已写入本次所选屏幕的 DA / DB 配置）：
+
+- PIN 认证成功：`D8=6985` → 验证已知 PIN → `D8=9000`；本仓库 App 已内置该步骤。
+- 配置写入确认成功，`D1=9000`。
+- **传图 53/53 全部 `SW=9000`** —— PN532 + 小线圈完全能完成 105984 字节的传图。
+- `D4=9000` 被接受，随后 DE 查询在约 2～3 秒时返回 **`68CA`（低电压告警）**。
+- 用 `refresh` 子命令（**不写 DA/DB、不重传图像，只重发 D4 + 轮询 DE**）把预充电从 1 s 加到 5 s、`--pre-refresh-ms 5000`、`--first-de-delay-ms 3000`、`--de-hz 3` 后重试，**仍在 `68CA` 上失败**。说明这不是充电时序问题，而是刷新波形期间的持续供能不足。
+
+### 三、下一步该怎么排
+
+1. **耦合第一**：把 PN532 天线整块压在线圈走线上（不是几何中心）、加 13.56 MHz 调谐中继环、给 PN532 模块独立 5 V 供电（不要只取 CH340 的 3.3 V），每改一处重跑一次 `refresh` 对照。
+2. **半屏刷新降低峰值电流**：`--passes two` 对本屏有效（two-pass.json 里 `huawei_a1_jd79665`，标记 `experimental`，每半溢出 90/120 秒观测窗口）。它会写 DA / DB 把驱动改成"半幅窗口"，**属于不可还原的写操作**，执行前想清楚。
+3. 重试刷新优先用 `refresh` 子命令，它对已存图像只做 D4 + DE，不碰配置：
+
+```powershell
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe -m ink_nfc_fmsc refresh --port COM14 --screen JD79665AA-552x768-BWRY-A1 --yes --verbose --timeout 120
+```
+
+> 写入后读到的板内配置（供对照，非原厂值）：
+> `A0 07 F0 C7 20 06 00 02 28` `A1 07 01 12 00 30 FF FF FF` `B1 01 02` `B2 01 14` `B3 01 00` `C0 04 20 1E A0 01` `C1 04 2E 6C 15 1E` `D1 07 01 20 00 00 00 00 00`
+
 ## v2.10-test1 手动选择 A0 / A1
 
 - “图像与发送”页新增屏幕类型选项，首次使用必须明确选择；不根据 D1、UID 或旧版设置猜测型号。切换后重新生成发送快照，运行中不能更改；发送确认和日志显示所选类型。
@@ -81,3 +182,141 @@ adb install -r dist/QPollLab-2.10-test1.apk
 - 接受已知的 `00120030FFFFFF` / `01120030FFFFFF` 扫描配置，并按读出的方向调整传输数据；其他规格校验仍然保留。写入前复核发现方向变化即停止，不传图。
 - 预览快照 SHA-256 与实际发送 SHA-256 分别记录；扫描方向转换发生在 D1 校验之后。只读检查仍可在未选择型号时执行，但不能据此识别 A0 / A1。
 - 全帧映射与参考打包函数逐字节比对通过，回归覆盖两种型号、两种扫描方向、实际 D3 数据、预览还原及未知选择拒绝；APK 构建和签名验证通过。尚未完成两种实物屏的刷新验证；此改动不解决 D1 返回 `6401` 的问题。
+
+## v2.11 已知缺陷：setReaderMode 反射签名不匹配
+
+v2.11.x 在部分 ROM 上**一条寻卡命令都发不出去**，日志形如：
+
+```
+CLEANUP_ERROR · 释放 ReaderMode 失败：java.lang.NoSuchMethodException: android.nfc.INfcAdapter.setReaderMode
+                [interface android.os.IBinder, interface android.nfc.IAppCallback, int, class android.os.Bundle, class java.lang.String]
+ERROR · NoSuchMethodException: ... at org.nfcresearch.qpolllab.QPollWorker.invoke(QPollWorker.java:76)
+RESTORE_FAILED · 恢复未确认，请重启 NFC 开关后再试
+PROCESS_EXIT · 2
+```
+
+**这与目标屏无关，是纯软件回归。** 较新的 Android 在 `INfcAdapter.setReaderMode` 末尾加了一个调用方包名参数；代码只按 5 参数签名反射，而目标设备的 NFC 服务上只存在经典的 4 参数签名，于是 `getMethod` 直接抛 `NoSuchMethodException`，ReaderMode 从未启用。
+
+已修两处（`src/org/nfcresearch/qpolllab/QPollWorker.java`）：
+
+1. `reader()` 改为按 **5 参数 → 4 参数** 依次探测并缓存命中的 `Method`，沿用成功时的参数个数装配实参；第一次命中会重新打印 `READER_API · 使用 setReaderMode N 参数接口`，可直接确认这台机走的是哪个签名。两种都没有时抛出提示两者的异常。
+2. `readerTouched = true` 移到 `reader(0x81)` **成功之后**。原先是在调用前赋值，导致启用失败也会被当成“已改动读头”，于是清理阶段再失败一次、并误报 `RESTORE_FAILED` 与退出码 2 —— 真正的 `NoSuchMethodException` 被这条假象盖住了。
+
+> 注意：修完这一处，日志会恢复成 `START` → `本轮超时，未收到标签`。那是另一个问题 —— 见上文「PN532 本机实测结论」：这块板只接受私有 7 位短帧 `7A`/`7D`，Android 公开 API 发不出来。本节的修复只负责让 App 回到“能正常发起寻卡”的状态，不代表能读到这块屏。
+
+### 术语对照：日志里的模式名 vs UI 按钮
+
+Worker 的命令行参数名和 UI 上的按钮名不一致，排查时对一下：
+
+| 日志 / 命令里的名字 | App 里的按钮 | 做什么 | 是否下发 QTag |
+|---|---|---|---|
+| `standard` | **普通 NFC-A 对照**（诊断页） | 只用系统标准 NFC-A 轮询找标签，只读 UID/ATQA/SAK，不发 APDU | 否 |
+| `qtag` | **测试 Q-Poll 能力**（诊断页） | 先开 QTag 再走同样的轮询，观察 NCI 是否真的用了 0x71 | 是 |
+| `qtag-hold` | **组合测试：QTag + 前台寻卡**（诊断页） | 只开 QTag 并驻留；**寻卡由应用前台进程执行**，绕开后台准入限制 | 是（仅此进程） |
+| `foreground` | **前台 ReaderMode 对照（应用进程）** | 不经过 worker，完全由应用进程调用 `enableReaderMode` 找标签 | 否 |
+| `inspect` | **检查芯片 / NFC**（诊断页） | 只读配置、确认 NXP 测试入口是否存在，不发寻卡命令 | 否 |
+| `identity` | **只读检查屏幕** | 找到标签后发 D1 校验屏幕规格，**不写图像** | 是 |
+| `refresh` | **发送当前预览到墨水屏** | 完整流程：D1→D8(PIN)→D3 传图→D4 刷新→DE 查忙 | 是 |
+
+验证上述 setReaderMode 修复时用 **`standard`（普通 NFC-A 对照）**：贴一张任意普通卡（银行卡、公交卡、门禁卡都行），10 秒内日志应出现 `READER_API · 使用 setReaderMode 4 参数接口` 和 `TAG 收到标签 UID=…`。能读到普通卡就证明寻卡链路恢复正常；读不到那块墨水屏是正常的，原因在上一段。
+
+## v2.12 根因：后台进程调用的 setReaderMode 会被系统静默忽略
+
+修好反射签名后仍然读不到**任何**标签（包括普通卡），不是还有一个软件 bug，而是撞上了 Android 框架的权限模型：
+
+```java
+// platform/packages/apps/Nfc · NfcService#setReaderMode（Android 12 起，AOSP / LineageOS 一致）
+int callingUid = Binder.getCallingUid();
+boolean privilegedCaller = (callingUid == Process.SYSTEM_UID
+        || getPackageNameFromUid(callingUid).equals("com.android.systemui"));
+if (!privilegedCaller && !mForegroundUtils.isInForeground(callingUid)) {
+    Log.e(TAG, "setReaderMode: Caller is not in foreground and is not system process.");
+    return;                      // ← 静默返回：不抛异常、不注册回调、不改轮询配置
+}
+```
+
+要点：
+
+- **调用成功的判定不可靠。** `READER_API · 使用 setReaderMode 4 参数接口` 只是反射找到方法并调用完毕，**不代表服务端接受了它**。服务端这一条路径是 `return`，不是 `throw`，所以进程不会报错，`START` 也会照常打印 —— 看起来一切正常，实际上轮询配置一行都没改。
+- **根 UID 也救不了。** 判定只看 UID：必须是 `Process.SYSTEM_UID`（1000）、包名 `com.android.systemui`，或者调用方处于前台。Worker 跑在 **UID 2000（shell）**、无 Activity，三个条件都不满足。
+- 因此 **App 现有架构下，任何标签都不可能送达 worker** —— 这与目标屏无关，普通卡同样收不到，此前的“超时未收到标签”不能用来推断硬件或线圈。
+
+### 对照验证（已加进 App）
+
+诊断页新增按钮 **「前台 ReaderMode 对照（应用进程）」**：同样的 `setReaderMode`、同样的 flags（`NFC_A | SKIP_NDEF_CHECK`），但由**应用自身进程**且带前台 Activity 调用，绕开上面这个判定。日志会出现：
+
+```
+FRAMEWORK · 由应用自身进程调用系统 ReaderMode：调用方 UID=10xxx，Activity 处于前台。
+START · foreground:10
+TAG 收到标签 UID=…；技术=[android.nfc.tech.NfcA, ...]
+RESULT · 已收到标签（前台 ReaderMode）；只显示元信息，未发送 APDU
+```
+
+判读：**普通卡在此模式下出现 `TAG`，而同模式的后台路径没有** ⇒ 确认是框架的后台限制。此后所有涉及 Q-Poll 的判定都必须改走这条前台路径，否则结论无效。
+
+同时 worker 的 logcat 过滤器加了 `NfcService` / `NfcDispatcher`，被忽略时会直接把框架那一行捞出来：
+
+```
+READER_IGNORED · 系统忽略本次 ReaderMode：调用方 UID=2000 既不是前台应用也不是 system；这一轮不会收到任何标签，判定的优先级高于本轮结果。
+RESULT · 本轮无结果：系统忽略了后台进程的 ReaderMode（见 READER_IGNORED 行）；不能据此认定硬件不支持
+```
+
+> 未改动的部分：这条路径仍然只会发标准 `26`/`52` 轮询，因此**墨水屏大概率依旧不出现**（见「PN532 本机实测结论」）。它解决的是“为什么连普通卡都收不到”，而不是“怎么唤醒墨水屏”。
+
+### 拆分修复：QTag 交给特权进程，寻卡交给前台进程
+
+上面那条判定带来一个无法回避的结论：**worker 永远不可能收到标签**。但开启 QTag 又必须走特权（`sendVendorNciMessage` 只有 shell/system 调得到）。这两件事本来就该由两个不同的进程分别做：
+
+| 动作 | 需要什么 | 由谁执行 |
+|---|---|---|
+| 开启 / 关闭 QTag（vendor NCI `31 01`） | shell / system 特权 | `QPollWorker`（UID 2000） |
+| `setReaderMode` 寻卡、收 `onTagDiscovered` | 调用方在前台 | `MainActivity` 所在的应用进程 |
+
+因此新增 worker 模式 **`qtag-hold`**：只做 `init → qtag(1) → 驻留等待 → qtag(0)`，**完全不碰 `setReaderMode`**（在那里调它只会被静默丢弃，白白留下一行误导日志）。驻留期间它持续读 logcat，所以 `NxpNciX` / `NxpNciR` 里的 `0x71` 证据仍然会被抓到。
+
+诊断页对应按钮 **「组合测试：QTag + 前台寻卡」**，时序是：
+
+```
+特权进程：QTAG_ON 启用 QTag（驻留模式），API 状态=0
+特权进程：START · qtag-hold:10
+应用进程：FRAMEWORK · QTag 已由特权进程开启；本进程 UID=10xxx（前台 Activity）接管 ReaderMode
+应用进程：START · foreground:10
+      …… 10 秒内贴合并观察 ……
+应用进程：RESULT · 组合测试：本轮超时，未收到标签；QTag 与前台 ReaderMode 均未产生标签
+特权进程：QTAG_OFF / RESTORED（应用写入 stop 文件后自动关闭 QTag）
+```
+
+`qtag-hold` 自带兜底：即使应用进程异常退出，驻留时间到（`seconds + 15` 秒）也会自己关掉 QTag，不会把 NFC 留在改写状态。
+
+**这个实验的判读要靠普通卡做标尺**，顺序不能省：
+
+| 步骤 | 普通卡（NTAG / MIFARE） | 判读 |
+|---|---|---|
+| ① 只开前台 ReaderMode | 有 `TAG` | 前台路径可用，框架限制确认 |
+| ② 组合测试（QTag 已开） | **读不到了** | QTag 真的把发现流程改写成了 `Q_POLL` —— 这正是我们要的状态 |
+| ② 组合测试（QTag 已开） | 仍能读到 | QTag 未生效或该 HAL 忽略它，`0x71` 那条线可以判死 |
+| ③ 组合测试 + 墨水屏 | 出现 `TAG` 且 `ATQA` 合理 | 私有 `7A`/`7D` 之外的**第二条**唤醒通路成立，App 有救 |
+| ③ 组合测试 + 墨水屏 | 仍无标签 | Q-Poll 不是这块板的唤醒方式，Android 侧定论为「公开 API 做不到」 |
+
+③ 的两种结果都有价值：前者意味着 App 只需按上面的分工重构就能用，后者则要放弃手机方案、转向 PN532 / 外接读头。
+
+## GitHub Actions 自动构建
+
+仓库里有 `.github/workflows/build-apk.yml`，不需要 Gradle —— 流水线就是「装 JDK + 补齐 build-tools → `python3 build.py`」。
+
+**触发条件**：push 到 `main` / `feature/**` / `fix/**`、PR、push `v*` 标签，或在 Actions 页面手动 `Run workflow`。
+
+**取产物**：Actions → 对应运行 → 底部 `Artifacts` → `QPollLab-apk`，内含 `QPollLab-<version>.apk` 与 `.sha256`。推送 `v*` 标签时会额外创建一个 Release 并附上 APK。
+
+**fork 之后第一次**：GitHub 对 fork 默认不自动运行 workflow，需要到 Actions 标签页点一次 “I understand my workflows, go ahead and enable them”。
+
+**签名要注意**：`build.py` 在没有现成 keystore 时会现场生成一把随机调试密钥，于是每次 CI 产物的签名都不同，直接覆盖安装会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（得先卸载）。两种解法：
+
+- 配一个仓库 secret `KEYSTORE_B64`（内容为 `base64 -w0 debug.keystore`），workflow 会还原它，签名从此固定；
+- 什么都不配也行，workflow 会用 Actions 缓存保存同一把钥匙 —— 但缓存 **7 天不用会被清理**，那时签名会重新随机。
+
+**工具链兼容**：优先用 `build-tools/34.0.0` + `platforms/android-34`；镜像里没有时 `build.py` 会自动回退到已安装的最新版本，workflow 也会先尝试用 `sdkmanager` 补装。本地构建命令不变：
+
+```sh
+ANDROID_HOME=/path/to/sdk JAVA_HOME=/path/to/jdk python3 build.py
+```

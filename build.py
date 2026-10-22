@@ -3,16 +3,38 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
 
 root = Path(__file__).resolve().parent
-sdk = Path(os.environ["ANDROID_HOME"])
+sdk = Path(os.environ.get("ANDROID_HOME") or os.environ["ANDROID_SDK_ROOT"])
 jdk = Path(os.environ["JAVA_HOME"])
+
+def version_key(path):
+    parts = re.findall(r"\d+", path.name)
+    return [int(part) for part in parts] or [0]
+
+# CI images rotate their preinstalled toolchain; prefer the pinned 34.0.0 and fall back to the
+# newest usable one instead of failing on a path that no longer exists.
 bt = sdk / "build-tools/34.0.0"
+if not (bt / "aapt").exists():
+    tools = [path for path in sdk.joinpath("build-tools").glob("*") if (path / "aapt").exists()] \
+        if sdk.joinpath("build-tools").is_dir() else []
+    if not tools:
+        raise RuntimeError("No build-tools with aapt found under " + str(sdk / "build-tools"))
+    bt = max(tools, key=version_key)
 android = sdk / "platforms/android-34/android.jar"
+if not android.is_file():
+    platforms = sorted((path / "android.jar" for path in sdk.joinpath("platforms").glob("android-*")
+                        if (path / "android.jar").is_file()), key=lambda path: version_key(path.parent)) \
+        if sdk.joinpath("platforms").is_dir() else []
+    if not platforms:
+        raise RuntimeError("No android.jar found under " + str(sdk / "platforms"))
+    android = platforms[-1]
+print("SDK:", sdk, "| build-tools:", bt.name, "| android.jar:", android.parent.name)
 build_root = root / "build"
 build_root.mkdir(parents=True, exist_ok=True)
 build = Path(tempfile.mkdtemp(prefix="v2-", dir=build_root))

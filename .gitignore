@@ -7,4 +7,7 @@ __pycache__/
 .env
 .env.*
 *.log
+/logs/
+/tmp-probe-*.log
 /local.properties
+/.workbuddy/

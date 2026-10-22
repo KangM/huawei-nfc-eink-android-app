@@ -1,0 +1,125 @@
+name: Build APK
+
+# 只需要 JDK + Android build-tools，不用 Gradle，因此整条流水线就是 python3 build.py。
+on:
+  push:
+    branches: [main, "feature/**", "fix/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write      # 打 tag 时创建 Release 需要
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Resolve Android SDK
+        run: |
+          set -euo pipefail
+          found=""
+          for candidate in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk "$HOME/Android/Sdk"; do
+            if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+              echo "ANDROID_HOME=$candidate" >> "$GITHUB_ENV"
+              echo "Using Android SDK at $candidate"
+              found=1
+              break
+            fi
+          done
+          [ -n "$found" ] || { echo "::error::找不到 Android SDK；运行器镜像可能变了。"; exit 1; }
+          echo "JAVA_HOME=${JAVA_HOME:-<unset>}"
+          python3 --version
+
+      - name: Install missing SDK components
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME}"
+          need=""
+          [ -x "$SDK/build-tools/34.0.0/aapt" ] || need="$need build-tools;34.0.0"
+          [ -f "$SDK/platforms/android-34/android.jar" ] || need="$need platforms;android-34"
+          if [ -z "$need" ]; then
+            echo "build-tools;34.0.0 与 platforms;android-34 已预装，跳过下载。"
+            exit 0
+          fi
+          echo "需要补装：$need"
+          SDKM=""
+          for candidate in "$SDK/cmdline-tools/latest/bin/sdkmanager" "$SDK/tools/bin/sdkmanager"; do
+            [ -x "$candidate" ] && SDKM="$candidate" && break
+          done
+          [ -n "$SDKM" ] || SDKM="$(command -v sdkmanager || true)"
+          [ -n "$SDKM" ] || { echo "::error::找不到 sdkmanager"; exit 1; }
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          # 许可已接受，--install 不会再交互提问；不要用 `yes |` 免得 pipefail 把 SIGPIPE 当失败
+          "$SDKM" --install $need
+
+      # CI 每次重新生成 debug.keystore 会导致签名变化，覆盖安装时会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+      # 有 KEYSTORE_B64 就用它（固定签名），否则用缓存尽量保持同一把钥匙。
+      - name: Restore signing key
+        id: keystore
+        uses: actions/cache@v4
+        with:
+          path: build/debug.keystore
+          key: qpolllab-debug-keystore-v1
+          restore-keys: |
+            qpolllab-debug-keystore-
+
+      - name: Prepare signing key from secret
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "未配置 KEYSTORE_B64，沿用缓存或本次生成的 debug.keystore。"
+            exit 0
+          fi
+          mkdir -p build
+          printf '%s' "$KEYSTORE_B64" | base64 -d > build/debug.keystore
+          echo "已用仓库 secret KEYSTORE_B64 还原固定签名。"
+
+      - name: Build
+        run: python3 build.py
+
+      - name: Show result
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          cat dist/*.sha256
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QPollLab-apk
+          path: |
+            dist/*.apk
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.apk dist/*.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.apk dist/*.sha256 \
+              --title "$GITHUB_REF_NAME" \
+              --notes "自动构建产物（$(date -u '+%Y-%m-%d %H:%M UTC')，commit ${GITHUB_SHA::7}）。"
+          fi

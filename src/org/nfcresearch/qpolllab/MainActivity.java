@@ -64,6 +64,13 @@ public final class MainActivity extends Activity {
         Shizuku.bindUserService(bridgeArgs,bridgeConnection);
     }catch(Exception e){append("Shizuku 连接失败："+e);}}
     private boolean scanning,terminal;
+    private android.nfc.NfcAdapter foregroundAdapter;
+    private volatile boolean foregroundScan,foregroundHit;
+    private final Runnable foregroundTimeout=new Runnable(){public void run(){stopForegroundScan("本轮超时，未收到标签");}};
+    /** Combo experiment: worker (UID 2000) only switches QTag on, this foreground Activity polls. */
+    private volatile boolean comboMode,comboStarted;
+    private int comboSeconds;
+    private final Runnable comboTimeout=new Runnable(){public void run(){finishCombo("本轮超时，未收到标签");}};
     private final SessionFailure failure=new SessionFailure();
     private long scanDeadline;
     private final Runnable tick=new Runnable(){public void run(){
@@ -101,6 +108,10 @@ public final class MainActivity extends Activity {
         page.addView(text("测试会开启短时寻卡，不发送图像或刷新指令。",12,0xff68766e));
         duration=spinner(new String[]{"寻卡 5 秒","寻卡 10 秒","寻卡 30 秒","寻卡 60 秒"});duration.setSelection(1);page.addView(duration);
         page.addView(action("测试 Q-Poll 能力",v->start("qtag")));page.addView(action("普通 NFC-A 对照",v->start("standard")));
+        page.addView(action("前台 ReaderMode 对照（应用进程）",v->startForegroundScan()));
+        page.addView(text("上一项由后台进程调用系统接口；本项改由应用自身进程调用同样的接口。两者对照，可判别后台调用是否被系统忽略。",12,0xff68766e));
+        page.addView(action("组合测试：QTag + 前台寻卡",v->startCombo()));
+        page.addView(text("组合测试把两件事分别交给合适的进程：后台特权进程只负责开启 QTag（Q-Poll 开关），寻卡由本应用前台进程执行。这是绕开「后台调用被系统忽略」的正解。",12,0xff68766e));
         page.addView(text("未读到标签不等于不支持 Q-Poll；成功寻卡也不代表墨水屏供电与刷新已验证。",12,0xff68766e));
         page=pageBodies[1];section(page,"图像与发送");
         page.addView(text("屏幕类型",14,0xff52635d));
@@ -156,10 +167,10 @@ public final class MainActivity extends Activity {
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
         page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
-        page.addView(text("墨水屏刷新测试 · v2.10-test1",12,0xff68766e));
+        page.addView(text("墨水屏刷新测试 · v2.13-combo-test1",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
         selectPage(getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("page",0));
-        append("v2.10-test1 就绪；设备测试 / 图像发送 / 高级参数；Shizuku 与 Root 可选。");source=PanelImage.testPattern();originalSource=source;prepare();
+        append("v2.13-combo-test1 就绪；诊断页含「前台 ReaderMode 对照」与「组合测试：QTag + 前台寻卡」。");source=PanelImage.testPattern();originalSource=source;prepare();
     }
     private void section(LinearLayout page,String title){TextView t=text(title,18,0xff142f2a);t.setTypeface(null,Typeface.BOLD);t.setPadding(0,dp(12),0,dp(6));page.addView(t);}
     private void selectPage(int index){activePage=Math.max(0,Math.min(2,index));for(int i=0;i<3;i++){pageScrolls[i].setVisibility(i==activePage?View.VISIBLE:View.GONE);tabs[i].setTextColor(i==activePage?Color.WHITE:0xff52635d);tabs[i].setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==activePage?0xff176b61:0xffe3eae6));}getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("page",activePage).apply();}
@@ -219,7 +230,9 @@ public final class MainActivity extends Activity {
             .setNegativeButton("返回预览",null).setPositiveButton("确认并开始刷新",(d,w)->start("refresh")).show();
     }
     private static String quote(String s){return "'"+s.replace("'","'\\''")+"'";}
-    private void start(final String mode){
+    private void start(final String mode){start(mode,false);}
+    private void startCombo(){start("qtag-hold",true);}
+    private void start(final String mode,final boolean combo){
         if(busy||preparing||editingCrop||!resumed)return;
         final boolean rootMode=useRoot.isChecked();
         if(!rootMode){try{if(!Shizuku.pingBinder()||Shizuku.checkSelfPermission()!=android.content.pm.PackageManager.PERMISSION_GRANTED){connectShizuku();return;}}catch(Exception e){append("请先连接 Shizuku："+e);return;}}
@@ -235,7 +248,8 @@ public final class MainActivity extends Activity {
                     job.put("panelType",prepared.panelType);job.put("imageFile",imageFile.getAbsolutePath());job.put("sha256",sha);job.put("powerMs",powerTimes[power.getSelectedItemPosition()]);job.put("pollMs",pollTimes[poll.getSelectedItemPosition()]);append("图片参数："+prepared.settings);append("预览快照 SHA-256="+sha);}
                 try(FileOutputStream out=new FileOutputStream(jobFile)){out.write(job.toString().getBytes("UTF-8"));}}
         }catch(Exception e){append("准备失败："+e);imageFile.delete();jobFile.delete();return;}
-        if(mode.equals("qtag"))capabilityInfo.setText("Q-Poll：测试中，等待实际寻卡命令与响应…");
+        if(mode.equals("qtag")||combo)capabilityInfo.setText("Q-Poll：测试中，等待实际寻卡命令与响应…");
+        comboMode=combo;comboStarted=false;if(combo)comboSeconds=seconds;
         stopFile=sessionStop;busy=true;terminal=false;scanning=false;failure.clear();controls();progress.setProgress(0);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         state.setText(rootMode?"等待 Root / NFC":"连接 Shizuku / NFC");detail.setText(rootMode?"请允许 Root 授权。":"使用 Shizuku 授权，无需 Root。");
@@ -254,12 +268,17 @@ public final class MainActivity extends Activity {
     private void event(String line){
         if(!line.startsWith("QP|")){if(!line.trim().isEmpty())append(line);return;}
         String[] p=line.split("\\|",3);if(p.length!=3)return;String kind=p[1],message=p[2];
+        if(comboMode&&kind.equals("QTAG_ON")&&!comboStarted){comboStarted=true;main.post(this::beginComboScan);}
+        if(comboMode&&!comboStarted&&(kind.equals("ERROR")||kind.equals("QTAG_REJECTED")||kind.equals("CLEANUP_ERROR")))append("组合测试未进入寻卡阶段：QTag 未能开启（见上方该行）。");
         if(kind.equals("CHIP"))chipInfo.setText("芯片："+message);
         if(kind.equals("CAPABILITY"))capabilityInfo.setText("Q-Poll："+message);
         if(kind.equals("QTAG_REJECTED"))capabilityInfo.setText("Q-Poll："+message);
         if(failure.accept(kind,message)){terminal=true;scanning=false;main.removeCallbacks(tick);state.setText("需要检查");detail.setText(failure.message());append(kind+" · "+message);return;}
         if(failure.present()){append(kind+" · "+message);return;}
-        if(kind.equals("START")){String[] f=message.split(":");scanning=true;scanDeadline=SystemClock.elapsedRealtime()+Integer.parseInt(f[1])*1000L;state.setText(f[0].equals("standard")?"普通 A 寻卡":"Q-Poll 寻卡中");main.post(tick);if(!resumed)requestStop("页面已离开");}
+        if(kind.equals("START")){
+            if(comboMode){state.setText("QTag 已开启 · 等待前台寻卡接管");detail.setText("保持贴合；本应用前台进程即将接管 ReaderMode。");}
+            else{String[] f=message.split(":");scanning=true;scanDeadline=SystemClock.elapsedRealtime()+Integer.parseInt(f[1])*1000L;state.setText(f[0].equals("standard")?"普通 A 寻卡":"Q-Poll 寻卡中");main.post(tick);if(!resumed)requestStop("页面已离开");}
+        }
         if(kind.equals("TAG")){scanning=false;main.removeCallbacks(tick);state.setText("收到标签");detail.setText(message);}
         if(kind.equals("STAGE")){scanning=false;main.removeCallbacks(tick);String[] s=message.split("\\|",2);state.setText(s.length==2?s[1]:message);detail.setText("当前贴合的墨水屏 · 保持贴合，不要切换应用。");}
         if(kind.equals("PROGRESS")){String[] f=message.split("\\|",3);int done=Integer.parseInt(f[0]),total=Integer.parseInt(f[1]);progress.setMax(total);progress.setProgress(done);detail.setText("已确认 "+done+" / "+total+" 包 · "+(100*done/total)+"% · 保持贴合");return;}
@@ -292,7 +311,82 @@ public final class MainActivity extends Activity {
     }
     private static byte[] readFile(File file)throws IOException {byte[] bytes=new byte[(int)file.length()];try(DataInputStream in=new DataInputStream(new FileInputStream(file))){in.readFully(bytes);}return bytes;}
     private void cancelBridge()throws Exception {android.os.IBinder binder=bridgeBinder;if(binder==null)return;Parcel request=Parcel.obtain(),reply=Parcel.obtain();try{request.writeInterfaceToken("org.nfcresearch.qpolllab.NfcSession");binder.transact(3,request,reply,0);reply.readException();}finally{request.recycle();reply.recycle();}}
-    private void requestStop(String reason){if(!busy)return;try{if(stopFile!=null)stopFile.createNewFile();append(reason+"；等当前通信返回后恢复 NFC，不重发写入。");stop.setEnabled(false);}catch(Exception e){append("停止标记失败："+e);}}
+    /** Same reader mode, but called from this process, which has a resumed Activity: since Android 12
+     *  NfcService silently ignores setReaderMode() from UID 2000 unless the caller is foreground or system. */
+    private void startForegroundScan(){
+        if(busy||preparing||editingCrop||!resumed)return;
+        comboMode=false;comboStarted=false;main.removeCallbacks(comboTimeout);
+        final int seconds=durations[duration.getSelectedItemPosition()];
+        busy=true;foregroundScan=true;foregroundHit=false;terminal=false;controls();progress.setProgress(0);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        append("──────── foreground · 前台 ReaderMode 对照 "+seconds+" 秒 ────────");
+        try{
+            foregroundAdapter=android.nfc.NfcAdapter.getDefaultAdapter(this);
+            if(foregroundAdapter==null)append("FRAMEWORK · 本机没有可用的 NFC 适配器。");
+            else{
+                android.os.Bundle extras=new android.os.Bundle();
+                extras.putInt(android.nfc.NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY,250);
+                foregroundAdapter.enableReaderMode(this,tag->{
+                    if(foregroundHit)return;
+                    foregroundHit=true;
+                    main.post(()->{if(destroyed)return;describeForegroundTag(tag);stopForegroundScan(null);});
+                },android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,extras);
+                append("FRAMEWORK · 由应用自身进程调用系统 ReaderMode：调用方 UID="+android.os.Process.myUid()+"，Activity 处于前台。");
+                event("QP|START|foreground:"+seconds);
+                state.setText("前台 ReaderMode 对照");
+                detail.setText("先把标签抬离；出现 START 后再贴回，"+seconds+" 秒内有效。");
+                main.postDelayed(foregroundTimeout,seconds*1000L);
+                return;
+            }
+        }catch(Throwable e){append("FRAMEWORK · 启用 ReaderMode 失败："+e);}
+        busy=false;foregroundScan=false;controls();getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+    private void describeForegroundTag(android.nfc.Tag tag){
+        StringBuilder uid=new StringBuilder();
+        for(byte b:tag.getId())uid.append(String.format("%02X",b&255));
+        event("QP|TAG|收到标签 UID="+uid+"；技术="+java.util.Arrays.toString(tag.getTechList()));
+        android.nfc.tech.NfcA nfcA=android.nfc.tech.NfcA.get(tag);
+        if(nfcA!=null){StringBuilder atqa=new StringBuilder();for(byte b:nfcA.getAtqa())atqa.append(String.format("%02X",b&255));
+            event("QP|META|ATQA="+atqa+"；SAK="+String.format("%04X",nfcA.getSak()&0xffff));}
+        event("QP|RESULT|已收到标签（应用进程 ReaderMode）；只显示元信息，未发送 APDU");
+    }
+    private void stopForegroundScan(String reason){
+        if(!foregroundScan)return;
+        foregroundScan=false;
+        main.removeCallbacks(foregroundTimeout);
+        if(foregroundAdapter!=null)try{foregroundAdapter.disableReaderMode(this);}catch(Throwable ignored){}
+        scanning=false;main.removeCallbacks(tick);
+        if(!foregroundHit&&reason!=null){terminal=true;event("QP|RESULT|前台 ReaderMode 本轮结束："+reason);}
+        busy=false;controls();
+        try{getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}catch(Throwable ignored){}
+    }
+    /** QTag is already on (privileged worker); poll from this process, which does hold a resumed Activity. */
+    private void beginComboScan(){
+        if(destroyed)return;
+        try{
+            foregroundAdapter=android.nfc.NfcAdapter.getDefaultAdapter(this);
+            if(foregroundAdapter==null){append("FRAMEWORK · 本机没有可用的 NFC 适配器。");finishCombo("本机没有可用的 NFC 适配器");return;}
+            android.os.Bundle extras=new android.os.Bundle();
+            extras.putInt(android.nfc.NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY,250);
+            foregroundHit=false;
+            foregroundAdapter.enableReaderMode(this,tag->{
+                if(foregroundHit)return;
+                foregroundHit=true;
+                main.post(()->{if(destroyed)return;describeForegroundTag(tag);finishCombo(null);});
+            },android.nfc.NfcAdapter.FLAG_READER_NFC_A|android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,extras);
+            append("FRAMEWORK · QTag 已由特权进程开启；本进程 UID="+android.os.Process.myUid()+"（前台 Activity）接管 ReaderMode。");
+            main.postDelayed(comboTimeout,comboSeconds*1000L);
+            event("QP|START|foreground:"+comboSeconds);
+        }catch(Throwable e){append("FRAMEWORK · 启用 ReaderMode 失败："+e);finishCombo("启用 ReaderMode 失败");}
+    }
+    /** Ends the foreground half; the worker notices the stop file and switches QTag back off. */
+    private void finishCombo(String reason){
+        main.removeCallbacks(comboTimeout);
+        if(foregroundAdapter!=null)try{foregroundAdapter.disableReaderMode(this);}catch(Throwable ignored){}
+        if(reason!=null&&!terminal){terminal=true;event("QP|RESULT|组合测试："+reason+"；QTag 与前台 ReaderMode 均未产生标签");}
+        if(stopFile!=null)try{stopFile.createNewFile();}catch(Exception ignored){}
+    }
+    private void requestStop(String reason){if(!busy)return;try{if(stopFile!=null)stopFile.createNewFile();append(reason+"；等当前通信返回后恢复 NFC，不重发写入。");stop.setEnabled(false);}catch(Exception e){append("停止标记失败："+e);}if(foregroundScan)stopForegroundScan(reason);if(comboStarted)finishCombo(reason);}
     private void showLicense(){
         StringBuilder body=new StringBuilder("参考 https://gitee.com/kur0neko/huawei-epd-pn532\n固定提交 5d3acf730a988815b637262fd4862c1794ab079e\nRequired Notice: Copyright (c) 2026 kur0neko\n\n");
         try(BufferedReader in=new BufferedReader(new InputStreamReader(getAssets().open("licenses/kur0neko-LICENSE.txt"),"UTF-8"))){String line;while((line=in.readLine())!=null)body.append(line).append('\n');}catch(Exception e){body.append(e);}

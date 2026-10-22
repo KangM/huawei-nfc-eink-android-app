@@ -29,10 +29,12 @@ public final class QPollWorker {
     private static final AtomicBoolean cleaned = new AtomicBoolean();
     private static final AtomicBoolean tagSeen = new AtomicBoolean();
     private static volatile boolean readerTouched, qtagTouched, readerReleased, qtagDisabled;
+    private static volatile Method readerMethod;
     private static int discoveredCode, lostCode = -1;
     private static Process logcat;
     private static volatile Tag detectedTag;
     private static volatile String qtagRejection;
+    private static volatile boolean readerIgnored;
     private static volatile boolean qDiscoverySent,qDiscoveryAccepted;
     private static String mode;
     private static final Binder callbackBinder = new Binder() {
@@ -80,8 +82,36 @@ public final class QPollWorker {
     private static void reader(int flags) throws Exception {
         Bundle extras=new Bundle();
         if("refresh".equals(mode)||"identity".equals(mode))extras.putInt("presence",5000);
-        invoke("setReaderMode", new Class<?>[]{IBinder.class, Class.forName("android.nfc.IAppCallback"),
-                int.class, Bundle.class, String.class}, token, callback, flags, extras, android.os.Process.myUid()==2000?"com.android.shell":"android");
+        String caller=android.os.Process.myUid()==2000?"com.android.shell":"android";
+        Method method=resolveReaderMode();
+        Object[] arguments=method.getParameterTypes().length==5
+                ? new Object[]{token, callback, flags, extras, caller}
+                : new Object[]{token, callback, flags, extras};
+        try { method.invoke(service, arguments); }
+        catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw e;
+        }
+    }
+    /** Newer stacks take a caller package as a fifth argument; older ones only declare the classic four. */
+    private static Method resolveReaderMode() throws Exception {
+        if (readerMethod != null) return readerMethod;
+        Class<?> callbackType = Class.forName("android.nfc.IAppCallback");
+        Class<?>[] withCaller = new Class<?>[]{IBinder.class, callbackType, int.class, Bundle.class, String.class};
+        Class<?>[] legacy = new Class<?>[]{IBinder.class, callbackType, int.class, Bundle.class};
+        try {
+            readerMethod = adapterType.getMethod("setReaderMode", withCaller);
+            emit("READER_API", "使用 setReaderMode 5 参数接口（含调用方包名）");
+        } catch (NoSuchMethodException five) {
+            try {
+                readerMethod = adapterType.getMethod("setReaderMode", legacy);
+                emit("READER_API", "使用 setReaderMode 4 参数接口");
+            } catch (NoSuchMethodException four) {
+                throw new NoSuchMethodException("当前系统没有可用的 INfcAdapter.setReaderMode 签名（已尝试 5 参数与 4 参数）");
+            }
+        }
+        return readerMethod;
     }
     private static int qtag(int action) throws Exception {
         return (Integer) invoke("sendVendorNciMessage", new Class<?>[]{int.class,int.class,int.class,byte[].class},
@@ -116,7 +146,7 @@ public final class QPollWorker {
         try {
             String since=new java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS",java.util.Locale.US).format(new java.util.Date());
             logcat = new ProcessBuilder("/system/bin/logcat", "-v", "threadtime", "-T", since,
-                    "NxpNciX:I", "NxpNciR:I", "*:S").redirectErrorStream(true).start();
+                    "NxpNciX:I", "NxpNciR:I", "NfcService:I", "NfcDispatcher:I", "*:S").redirectErrorStream(true).start();
             Thread monitor = new Thread(() -> {
                 try (BufferedReader in = new BufferedReader(new InputStreamReader(logcat.getInputStream()))) {
                     String line;
@@ -135,6 +165,19 @@ public final class QPollWorker {
                         }
                         if (line.contains("NxpNciX") && packet.startsWith("2103")) emit("RF_TX", packet);
                         if (line.contains("NxpNciR") && (packet.startsWith("4103") || packet.startsWith("6103") || packet.startsWith("6105"))) emit("RF_RX", packet);
+                        // Since Android 12 NfcService silently drops setReaderMode() for callers that are
+                        // neither foreground nor system; without these lines the failure is invisible.
+                        if (!cleaned.get() && (line.contains("NfcService") || line.contains("NfcDispatcher"))) {
+                            String frame = packet.length() > 220 ? packet.substring(0, 220) : packet;
+                            if (frame.contains("Caller is not in foreground")) {
+                                readerIgnored = true;
+                                emit("READER_IGNORED", "系统忽略本次 ReaderMode：调用方 UID=" + android.os.Process.myUid()
+                                        + " 既不是前台应用也不是 system；这一轮不会收到任何标签，判定的优先级高于本轮结果。");
+                            } else if (frame.contains("setReaderMode") || frame.contains("forced to disable")
+                                    || frame.contains("NFC is not enabled")) {
+                                emit("FRAMEWORK", frame);
+                            }
+                        }
                     }
                 } catch (Exception ignored) { }
             }, "nci-monitor");
@@ -161,7 +204,7 @@ public final class QPollWorker {
         int exit = 0;
         boolean sessionStarted = false;
         try {
-            if ((args.length != 4&&args.length!=5) || !(args[0].equals("inspect") || args[0].equals("qtag") || args[0].equals("standard")||args[0].equals("identity")||args[0].equals("refresh")))
+            if ((args.length != 4&&args.length!=5) || !(args[0].equals("inspect") || args[0].equals("qtag") || args[0].equals("qtag-hold") || args[0].equals("standard")||args[0].equals("identity")||args[0].equals("refresh")))
                 throw new IllegalArgumentException("Invalid mode or argument count");
             mode=args[0];
             boolean panelOperation=mode.equals("identity")||mode.equals("refresh");
@@ -185,14 +228,34 @@ public final class QPollWorker {
                 setupCallback();
                 Runtime.getRuntime().addShutdownHook(new Thread(QPollWorker::cleanup));
                 startLogcat();
+                // Hold-only mode: switch QTag on and keep it on while the app process polls in the
+                // foreground. This process never calls setReaderMode() -- the framework drops it for
+                // UID 2000 callers without a foreground Activity, so doing it here is pointless.
+                if (args[0].equals("qtag-hold")) {
+                    qtagTouched = true;
+                    int status = qtag(1);
+                    emit("QTAG_ON", "启用 QTag（驻留模式），API 状态=" + status + "（只是主机状态）");
+                    if (status != 0) throw new IllegalStateException("QTag 启用失败");
+                    sessionStarted = true;
+                    emit("START", "qtag-hold:" + seconds);
+                    long holdDeadline = SystemClock.elapsedRealtime() + (seconds + 15) * 1000L;
+                    while (!stopFile.exists() && SystemClock.elapsedRealtime() < holdDeadline) SystemClock.sleep(50);
+                    if (qDiscoverySent) emit("CAPABILITY", qDiscoveryAccepted
+                            ? "驻留期间已确认控制器接受 Q-Poll 寻卡（0x71）。"
+                            : "驻留期间已发出 0x71，但未获得成功响应。");
+                    emit("RESULT", stopFile.exists()
+                            ? "组合测试结束，QTag 即将关闭；本进程未发送任何 APDU"
+                            : "驻留时间到，自动关闭 QTag；本进程未发送任何 APDU");
+                    return;
+                }
                 if (args[0].equals("qtag")||panelOperation) {
                     qtagTouched = true;
                     int status = qtag(1);
                     emit("QTAG_ON", "启用 QTag，API 状态=" + status + "（只是主机状态）");
                     if (status != 0) throw new IllegalStateException("QTag 启用失败");
                 }
-                readerTouched = true;
                 reader(0x81); // NFC-A + skip NDEF; the NXP extension rewrites discovery to Q_POLL.
+                readerTouched = true;
                 sessionStarted = true;
                 emit("START", args[0] + ":" + seconds);
                 long deadline = SystemClock.elapsedRealtime() + seconds * 1000L;
@@ -228,6 +291,7 @@ public final class QPollWorker {
                 }
                 else if (tagSeen.get()) emit("RESULT", "已收到标签；只显示元信息，未发送 APDU");
                 else if (stopFile.exists()) emit("RESULT", "用户停止；未收到标签");
+                else if (readerIgnored) emit("RESULT", "本轮无结果：系统忽略了后台进程的 ReaderMode（见 READER_IGNORED 行）；不能据此认定硬件不支持");
                 else emit("RESULT", "本轮超时，未收到标签；不能据此认定硬件不支持");
                 } finally { cleanup(); }
             }
