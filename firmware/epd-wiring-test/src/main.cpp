@@ -566,15 +566,17 @@ static void check_busy_line(void) {
     Serial.printf("[1/6] BUSY 线路判别：浮空读 %d，32 次里 %d 次为高，内部上拉后读 %d\n",
                   floating, high, pulled);
 
-    if (floating == 0 && pulled == 1) {
-        Serial.println("      >> 结论：BUSY 这根线基本是断的（上拉能拉起来 = 对面没接东西）");
-        Serial.println("         量 IO10 到屏 BUSY 的通断；这种状态下的忙/闲读数全不可信");
-    } else if (pulled == 0) {
+    if (pulled == 0) {
         Serial.println("      >> 结论：BUSY 被外部拉低（45k 上拉拉不动）");
         Serial.println("         两种可能：① 屏在复位态主动拉低 ② 这根线对 GND 短路");
         Serial.println("         若下面 [2/6] 放开 RST 后仍不升高，优先怀疑 RST 没接到屏");
+    } else if (floating == 0) {
+        Serial.println("      >> 结论：BUSY 这根线基本是断的（上拉能拉起来 = 对面没接东西）");
+        Serial.println("         量 IO10 到屏 BUSY 的通断；这种状态下的忙/闲读数全不可信");
     } else if (high != 32) {
-        Serial.println("      >> 结论：电平在跳，接触不良（先重焊 BUSY）");
+        Serial.println("      >> 结论：线路浮空且在抖 —— 屏没有驱动这根线");
+        Serial.println("         典型原因：屏那边没电（3V3/GND 断了）、或 BUSY 线断了");
+        Serial.println("         量屏侧 3V3 对 GND 有没有 3.3V，再量这根线的通断");
     } else {
         Serial.println("      >> 结论：空闲电平正常");
     }
@@ -589,20 +591,33 @@ static void reset_and_trace(void) {
     digitalWrite(PIN_EPD_RST, HIGH);
 
     char trace[129];
-    int n = 0, first_high = -1;
+    int n = 0;
+    bool saw_low = false, saw_rise = false;
+    int rise_ms = -1;
     uint32_t t0 = millis();
     while (millis() - t0 < 500 && n < 128) {
         int lv = busy_level();
         trace[n++] = (lv == BUSY_READY) ? '1' : '0';
-        if (lv == BUSY_READY && first_high < 0) first_high = (int)(millis() - t0);
+        uint32_t now = millis() - t0;
+        if (lv != BUSY_READY) {
+            saw_low = true;
+        } else if (saw_low && !saw_rise) {
+            saw_rise = true;
+            rise_ms = (int)now;
+        }
         delay(2);
     }
     trace[n] = 0;
     Serial.printf("      复位后 500ms 内 BUSY 轨迹（每 2ms 一点）：%s\n", trace);
-    if (first_high < 0) {
-        Serial.println("      >> 放开 RST 后 BUSY 一直没升高 ⇒ RST(IO2) 大概没接到屏，或屏没供电");
+
+    /* 只有"先低后高"才算真正的释放。轨迹一开始就是 1 绝不能算通 ——
+     * 那是线路浮空被上拉的结果，v2 曾在这里误报成"复位通路正常"。 */
+    if (saw_rise) {
+        Serial.printf("      >> BUSY 在 %d ms 由低转高，复位通路正常\n", rise_ms);
+    } else if (saw_low) {
+        Serial.println("      >> 被拉低后再没升高 ⇒ RST(IO2) 可能没接到屏，或屏没供电");
     } else {
-        Serial.printf("      >> BUSY 在 %d ms 释放，复位通路正常\n", first_high);
+        Serial.println("      >> 全程为高，BUSY 从未被拉低 ⇒ 屏没有响应复位：没上电，或线没接上");
     }
 }
 
@@ -618,6 +633,11 @@ void setup() {
     pinMode(PIN_EPD_BUSY, INPUT);  /* 屏侧自己驱动，常态不上拉，避免掩盖浮空 */
 
     check_busy_line();
+
+    /* 之后统一用内部上拉：屏是推挽输出，45k 上拉压不过它，判读不受影响；
+     * 但线断了的时候能把抖动的高阻节点定成稳定的 1，日志才不会一片噪声。 */
+    pinMode(PIN_EPD_BUSY, INPUT_PULLUP);
+    delay(2);
 
     SPI.begin(PIN_EPD_SCK, -1, PIN_EPD_MOSI, -1);
     SPI.beginTransaction(SPISettings(EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
