@@ -282,6 +282,7 @@ public final class QPollWorker {
                     emit("CHIP",ChipInfo.inspect());
                     adapterType.getMethod("sendVendorNciMessage", int.class, int.class, int.class, byte[].class);
                     emit("READY", "NXP 测试入口存在，可开始测试（尚未验证空口能力）");
+                    for (String line : CapabilityReport.lines()) emit("SYSTEM", line);
                     emit("END", "权限检查完成，未发送寻卡命令"); return;
                 }
                 if (stopFile.exists()) { emit("END", "已取消，未启动寻卡"); return; }
