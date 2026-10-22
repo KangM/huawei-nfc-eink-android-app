@@ -201,13 +201,55 @@ C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe ^
 > 唯一被记录过的 A1 成功刷新是 PCR532 + 手机原配大线圈 + 板内原厂驱动（见「判定口径」）。
 > 本机现在既没有原配大线圈，原厂驱动也已被早先的写操作覆盖 —— 期望值要按这个前提定。
 
-> **需要知道的上游事实**：`drivers.json` 里本屏 `huawei_a1_jd79665` 的 `experimental=True`，`qualification` 原文是
-> *"Historical inconsistent/partial refresh and power/RF errors; native/half optical success not qualified."*，
-> 而 `hardware_evidence_source` 写的是 *"NOT a new CLI hardware test"*。也就是说**上游自己从未确认过这块屏能透过 NFC 完整刷新成功**。
-> 唯一被记录过的 A1 成功刷新是 PCR532 + 手机原配大线圈 + 板内原厂驱动（见「判定口径」）。
-> 本机现在既没有原配大线圈，原厂驱动也已被早先的写操作覆盖 —— 期望值要按这个前提定。
+### 三、D4 无回包（`RF=01`）说明什么 —— 以及怎么判断有没有刷坏
 
-### 三、下一步该怎么排：先测量，再改一处
+实测序列（2026-10-22 18:25，外接 3.3 V 之后）：
+
+```
+18:25:11  已连接 UID 2E6C151E  D1=9000
+18:25:11  D8=6985 → PIN → 9000         权限正常
+18:25:11  屏幕配置已确认      D1=9000   配置正常
+18:25:13  传图 53/53 全部 9000          图像已完整写入帧存
+18:25:15  D4 → RF_TIMEOUT              启动波形时没有回包
+```
+
+**这不是「刷坏」**。`D1`（身份 / NVM）、`D8`（权限）、`D3`（53 块图像）全部 `9000`，
+说明 ASIC 的 ROM、私有配置、图像存储都还活着 —— 坏掉的只是「启动波形那一刻的回包」。
+
+`D4` 的回包是**短确认**（`--d4-timeout` 默认 8 s，注释写明 *acknowledgement deadline, not waveform duration*），
+而 `--rf-timeout-ms` 默认只有 1000 ms。波形一起，驱动板负载把场拉塌，回包就在这 1 秒里丢掉。
+所以 **D4 无回包有两种完全不同的含义，必须用 DE 区分**：
+
+| D4 无回包之后 | 含义 | 该怎么办 |
+|---|---|---|
+| DE 能问到，且报忙（`01` 或 `68CA`） | **刷新其实已经启动**，只是确认包丢了 | 保持贴合，等它刷完；先目视看屏 |
+| DE 也能问到，但一直空闲 | D4 真的没被接受 | 重发 D4（`--no-d4` 之外的那条路径），先改善耦合 |
+| DE 完全无回包 | 波形期间芯片彻底掉电 / 场塌 | 耦合与供能问题，不要反复重试 |
+
+`refresh_hold.py` 现在正是按这个判据工作的：D4 抛错不再中止，单次 DE 无回包也不再判死，
+最终会把「`d4_reply_lost` + 是否见到忙」一起报出来。
+
+```powershell
+# 只看板子现在是不是卡在波形里（只读：D1/D8/DE，不写配置、不重发 D4）
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe ^
+    tools\refresh_hold.py --port COM14 --screen JD79665AA-552x768-BWRY-A1 --no-d4 --seconds 30 --yes
+
+# 重新启动一轮刷新（D4 回包容忍 3 秒，DE 观察 90 秒）
+... tools\refresh_hold.py --port COM14 --screen JD79665AA-552x768-BWRY-A1 --seconds 90 --yes
+```
+
+**关于外接 3.3 V 的接法与风险**（这几条比参数重要）：
+
+- 只能接到芯片侧 **VDD**（稳压之后），**不要接整流输出 / `Vrect` 那一轨** —— 那是场内取电的中间轨，
+  板内稳压会与外部电源对顶，波形期间反而更容易塌。
+- 就近并 **100–470 µF** 低 ESR 电容，线要短要粗；台式电源把限流设到 300 mA 左右。
+- 正负极接反会直接打死 ASIC；上电前用万用表确认，最好串一个肖特基防倒灌。
+- 外接电**不能**替代射频场对 `D4` 的影响：波形期间芯片仍要靠场维持 ISO-DEP 会话，耦合差照样丢包。
+
+**别再用 `send-test` 做重试**：它每次都会重写 `DA`/`DB`（本机原厂驱动早已丢失，再写只是重复覆盖）。
+重试统一走 `refresh` 或 `refresh_hold.py`，它们只做 `D4 + DE`。
+
+### 四、下一步该怎么排：先测量，再改一处
 
 盲目换位置、换参数会让每次刷新都变成一次随机实验。用 `tools/power_diag.py` 把「耦合余量」先变成数字：
 

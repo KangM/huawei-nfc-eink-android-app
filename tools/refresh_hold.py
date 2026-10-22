@@ -60,10 +60,13 @@ def sw_text(sw: int) -> str:
 
 
 def hold_poll(poll, now, pause, *, duration: float, first_delay: float, de_hz: float,
-              min_observation: float = MIN_OBSERVATION, report=print) -> dict:
+              min_observation: float = MIN_OBSERVATION, max_link_errors: int = 5, report=print) -> dict:
     """按住场反复查询 DE，把「忙」当成可以继续等，而不是错误。
 
     poll() -> (sw:int, data:bytes)；now() -> float 秒；pause(seconds)
+
+    波形一旦启动，芯片可能连 DE 都短暂不答（射频场被负载拉塌），所以连续几次超时要容忍，
+    超过 max_link_errors 次才认作链路真的断了。
     """
     started = now()
     deadline = started + max(0.0, duration)
@@ -72,16 +75,22 @@ def hold_poll(poll, now, pause, *, duration: float, first_delay: float, de_hz: f
     outcome, detail = "TIMEOUT", ""
     busy_seen = False
     idle = 0
+    link_errors = 0
     if first_delay > 0:
         pause(min(first_delay, max(0.0, deadline - now())))
     while now() < deadline:
         elapsed = now() - started
         try:
             sw, data = poll()
-        except Exception as exc:                      # 空口异常：记录后按中止处理，不装作成功
-            outcome, detail = "ABORTED_LINK", str(exc)
-            report(f"{elapsed:6.1f}s  空口失败：{exc}")
-            break
+        except Exception as exc:
+            link_errors += 1
+            report(f"{elapsed:6.1f}s  无回包（第 {link_errors}/{max_link_errors} 次）：{exc}")
+            if link_errors > max_link_errors:
+                outcome, detail = "ABORTED_LINK", f"连续 {link_errors} 次无回包：{exc}"
+                break
+            pause(max(0.0, 1.0 / de_hz))
+            continue
+        link_errors = 0
         samples.append((elapsed, sw, data))
         counts[sw] = counts.get(sw, 0) + 1
         if sw in BUSY_SW:
@@ -157,6 +166,7 @@ def real(args) -> int:
                         ("--de-hz", args.de_hz), ("--de-timeout", args.de_timeout),
                         ("--d4-timeout", args.d4_timeout), ("--first-de-delay-ms", args.first_de_delay_ms),
                         ("--precharge-ms", args.precharge_ms), ("--pre-refresh-ms", args.pre_refresh_ms),
+                        ("--rf-timeout-ms", args.rf_timeout_ms),
                         ("--timeout", args.seconds)):
         if value is None:
             continue
@@ -185,15 +195,23 @@ def _hold_factory(base, settings, logger, args, **kw):
     def observe(job, *, timeout=None):
         duration = float(timeout if timeout is not None else job.timeout)
         device.begin_stage("刷新", "启动刷新并按住射频场，遇到忙态不放弃...")
+        lost_reply = False
         if not args.no_d4:
-            result = device.exchange(f"{job.name} D4", job.d4,
-                                     timeout=min(settings.d4_timeout, duration), require_ok=False)
-            device.report(f"D4 返回 SW={result.sw:04X} {sw_text(result.sw)}",
-                          level="success" if result.sw == 0x9000 else "warning")
-            if result.sw != 0x9000 and result.sw not in BUSY_SW:
-                result.require_ok("D4")
-            if result.sw in BUSY_SW:
-                device.report("D4 也报忙：不重发（重发可能打断已开始的波形），直接进 DE 观察。", level="warning")
+            try:
+                result = device.exchange(f"{job.name} D4", job.d4,
+                                         timeout=min(settings.d4_timeout, duration), require_ok=False)
+            except Exception as exc:
+                # D4 是全场最耗电的一步：波形一起，回包常在电压塌陷时丢掉。
+                # 「没有回包」不等于「没收到命令」—— 去问 DE 才知道板子到底动没动。
+                lost_reply = True
+                device.report(f"D4 没有回包（{exc}）；不能断定命令没被接受，继续观察 DE。", level="warning")
+            else:
+                device.report(f"D4 返回 SW={result.sw:04X} {sw_text(result.sw)}",
+                              level="success" if result.sw == 0x9000 else "warning")
+                if result.sw != 0x9000 and result.sw not in BUSY_SW:
+                    result.require_ok("D4")
+                if result.sw in BUSY_SW:
+                    device.report("D4 也报忙：不重发（重发可能打断已开始的波形），直接进 DE 观察。", level="warning")
         device.report(f"观察窗口 {duration:g} 秒，DE 查询 {settings.de_hz:g} Hz。", detail=False)
 
         def poll():
@@ -204,6 +222,9 @@ def _hold_factory(base, settings, logger, args, **kw):
         outcome = hold_poll(poll, device.clock, device.sleep, duration=duration,
                             first_delay=settings.first_de_delay_ms / 1000.0, de_hz=settings.de_hz,
                             report=lambda line: device.report(line, detail=False))
+        outcome["d4_reply_lost"] = lost_reply
+        if lost_reply and outcome["outcome"] in ("HELD_ALL_BUSY", "REFRESH_DONE"):
+            outcome["detail"] += "；D4 回包虽丢，但板子随后报告过忙 ⇒ 刷新命令其实已被接受"
         device.log.event("refresh_hold", {k: v for k, v in outcome.items() if k != "samples"})
         device.report(f"{outcome['outcome']} · {outcome['detail']}",
                       level="success" if outcome["outcome"] == "REFRESH_DONE" else "warning", detail=False)
@@ -264,12 +285,20 @@ def selftest() -> int:
     checks.append(("空闲无忙 ⇒ IDLE_NO_BUSY", res["outcome"] == "IDLE_NO_BUSY"))
     checks.append(("IDLE 判定不早于最小观察窗口", res["elapsed"] >= MIN_OBSERVATION))
 
-    # 6) 链路异常
+    # 6) 链路异常要连续超过阈值才中止（单次超时可能只是波形拉塌了场）
     clock = [0.0]
-    res = hold_poll(scripted([(0x9000, b"\x01"), RuntimeError("no tag")], clock),
-                    lambda: clock[0], lambda s: None, duration=30, first_delay=0, de_hz=1000,
+    seq_tol = ([(0x9000, b"\x01"), RuntimeError("no tag")] * 2) + [(0x9000, b"\x01")] * 50
+    res = hold_poll(scripted(seq_tol, clock),
+                    lambda: clock[0], lambda s: None, duration=6, first_delay=0, de_hz=1000,
                     report=lambda *_: None)
-    checks.append(("空口异常 ⇒ ABORTED_LINK", res["outcome"] == "ABORTED_LINK"))
+    checks.append(("单次无回包不中止", res["outcome"] != "ABORTED_LINK"))
+    clock = [0.0]
+    seq6 = []
+    for _ in range(8):
+        seq6 += [(0x9000, b"\x01"), RuntimeError("no tag")]
+    res = hold_poll(scripted(seq6, clock), lambda: clock[0], lambda s: None,
+                    duration=60, first_delay=0, de_hz=1000, report=lambda *_: None)
+    checks.append(("连续无回包超过阈值 ⇒ ABORTED_LINK", res["outcome"] == "ABORTED_LINK"))
 
     # 7) 数据字节异常
     clock = [0.0]
@@ -307,6 +336,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--de-timeout", type=float, default=10.0)
     p.add_argument("--d4-timeout", type=float, default=15.0)
     p.add_argument("--first-de-delay-ms", type=float, default=1000.0)
+    p.add_argument("--rf-timeout-ms", type=float, default=3000.0,
+                   help="等待驱动板回包的最短时限；波形刚启动时回包容易被丢掉，默认放宽到 3 秒")
     p.add_argument("--precharge-ms", type=float, default=1000.0)
     p.add_argument("--pre-refresh-ms", type=float, default=1000.0)
     p.add_argument("--no-d4", action="store_true", help="只观察，不重发 D4")
