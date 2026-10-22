@@ -300,6 +300,41 @@ RESULT · 本轮无结果：系统忽略了后台进程的 ReaderMode（见 READ
 
 ③ 的两种结果都有价值：前者意味着 App 只需按上面的分工重构就能用，后者则要放弃手机方案、转向 PN532 / 外接读头。
 
+### 2026-10-22 实测：① 成立、② 也成立（QTag 被控制器拒绝）
+
+v2.13-combo-test1 在实机上跑出下面两段（同一张 MIFARE Classic 普通卡）：
+
+```
+──── foreground · 前台 ReaderMode 对照 10 秒 ────
+FRAMEWORK · 由应用自身进程调用系统 ReaderMode：调用方 UID=10430，Activity 处于前台。
+TAG · 收到标签 UID=AAB59F1F；技术=[android.nfc.tech.NfcA, android.nfc.tech.MifareClassic]
+META · ATQA=0400；SAK=0008
+
+──── qtag-hold · 寻卡 10 秒 ────
+STATE · 执行身份 UID=0；NFC 状态=3（已开启）
+QTAG_ON · 启用 QTag（驻留模式），API 状态=0（只是主机状态）
+QTAG_REJECTED · 系统拒绝 QTag，响应状态=05；当前系统未成功开启 Q-Poll。
+TAG · 收到标签 UID=AAB59F1F；……（前台寻卡照常拿到标签）
+RF_TX · 210303010001
+RF_RX · 61051501808000FF010A040004AAB59F1F01080000000000
+```
+
+三条结论：
+
+1. **框架限制确证。** 同一台机器、同样的 flags，应用进程（UID 10430、有前台 Activity）一次就拿到标签；后台 worker 无论 UID 2000 还是 0 都拿不到。
+2. **Q-Poll 在本机不可用。** 这次 worker 跑在 **UID=0（Root）**，权限不可能更宽，控制器仍返回 `05`。按 NCI 状态表，`05 = SYNTAX_ERROR`，`07/08` 才是「不支持该命令组/命令」。所以下一步要区分的是**编码不对**还是**功能缺失**，而不是权限。
+3. **NCI 层不再失明（修正早先判断）。** `RF_TX` / `RF_RX` 现在能稳定打出来 —— 之前「`NxpNciX`/`NxpNciR` 一个包都不吐」的结论，是因为当时后台 ReaderMode 被丢弃、根本没有空口活动，不是因为日志 tag 不对。
+
+为此新增诊断项 **「QTag 命令探测（只读扫参）」**（worker 模式 `qtag-sweep`）：依次发出 7 种厂商命令编码，并把控制器每条原始响应 `4F70…` 连同状态码含义打印出来。
+
+| 探测结果 | 含义 | 下一步 |
+|---|---|---|
+| 某个候选返回 `00` | 编码问题，Q-Poll 功能其实存在 | 用它替换 `qtag()` 的 payload，重跑组合测试 |
+| 全部返回 `05` | 命令结构始终不被接受 | 基本无望，但仍可试 NCI 层 `RF_DISCOVER` 直填 `0x71` |
+| 返回 `07` / `08` | 该固件没有这条命令 | Q-Poll 判死，手机方案到此为止 |
+
+无论哪种结果，**按下按钮前先确认电池与贴合位置**：探测只改读卡器配置，不写屏幕、不传图，失败也不会损坏驱动板。
+
 ## GitHub Actions 自动构建
 
 仓库里有 `.github/workflows/build-apk.yml`，不需要 Gradle —— 流水线就是「装 JDK + 补齐 build-tools → `python3 build.py`」。

@@ -36,7 +36,19 @@ public final class QPollWorker {
     private static volatile String qtagRejection;
     private static volatile boolean readerIgnored;
     private static volatile boolean qDiscoverySent,qDiscoveryAccepted;
+    private static volatile boolean sweepMode;
     private static String mode;
+    // Candidate payloads for the NXP proprietary RF command (MT=1, GID=0x0F, OID=0x70). The shipping
+    // payload is 31 01; the rest probe whether status 0x05 means "wrong encoding" or "not supported".
+    private static final String[][] QTAG_VARIANTS = {
+            {"3101", "当前实现"},
+            {"310100", "加一个 00 参数"},
+            {"310101", "加一个 01 参数"},
+            {"310102", "加一个 02 参数"},
+            {"31010000", "加两个 00 参数"},
+            {"3100", "子命令 00"},
+            {"31", "仅子命令字节"},
+    };
     private static final Binder callbackBinder = new Binder() {
         @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
                 throws RemoteException {
@@ -114,8 +126,50 @@ public final class QPollWorker {
         return readerMethod;
     }
     private static int qtag(int action) throws Exception {
+        return qtagRaw(new byte[]{0x31, (byte) action});
+    }
+    /** Vendor RF channel: MT=1, GID=0x0F (proprietary), OID=0x70. The binder return value is only a
+     *  host-side status; the controller's real answer comes back as a 4F70 packet in the HAL log. */
+    private static int qtagRaw(byte[] payload) throws Exception {
         return (Integer) invoke("sendVendorNciMessage", new Class<?>[]{int.class,int.class,int.class,byte[].class},
-                1, 15, 112, new byte[]{0x31, (byte) action});
+                1, 15, 112, payload);
+    }
+    private static String nciStatusText(String status) {
+        switch (status) {
+            case "00": return "成功";
+            case "01": return "REJECTED，控制器拒绝";
+            case "02": return "RF 帧损坏";
+            case "03": return "FAILED，执行失败";
+            case "04": return "NOT_INITIALIZED，控制器未初始化";
+            case "05": return "SYNTAX_ERROR，命令结构不被接受";
+            case "06": return "SEMANTIC_ERROR，语义错误";
+            case "07": return "UNKNOWN_GID，不支持该命令组";
+            case "08": return "UNKNOWN_OID，不支持该命令";
+            case "09": return "INVALID_PARAM，参数取值非法";
+            case "0A": return "MESSAGE_SIZE_EXCEEDED，长度超限";
+            default: return "未收录状态码";
+        }
+    }
+    private static byte[] parseHex(String hex) {
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        return out;
+    }
+    private static void sweepQtag() {
+        sweepMode = true;
+        emit("QTAG_SWEEP", "开始枚举厂商命令：" + QTAG_VARIANTS.length + " 个候选，间隔 400 ms；"
+                + "只改读卡器配置，不写屏幕、不传图。");
+        for (int i = 0; i < QTAG_VARIANTS.length; i++) {
+            emit("QTAG_TRY", "候选 " + (i + 1) + "/" + QTAG_VARIANTS.length + " · " + QTAG_VARIANTS[i][0]
+                    + "（" + QTAG_VARIANTS[i][1] + "）");
+            try { qtagRaw(parseHex(QTAG_VARIANTS[i][0])); }
+            catch (Exception e) { emit("QTAG_TRY_FAIL", QTAG_VARIANTS[i][0] + " 发送失败：" + e); }
+            SystemClock.sleep(400);
+        }
+        try { qtagRaw(new byte[]{0x31, 0x00}); } catch (Exception ignored) { }
+        SystemClock.sleep(300);
+        emit("RESULT", "枚举完成：把上面每条 QTAG_RESP 的状态码对照起来看。"
+                + "出现 00 即该编码可用；若全部是 05/07/08，说明当前固件没有这条 Q-Poll 厂商命令，手机方案到此为止。");
     }
     private static void init() throws Exception {
         if (android.os.Process.myUid() != 0 && android.os.Process.myUid()!=2000) throw new SecurityException("需要 Shizuku 或 Root 授权");
@@ -159,9 +213,15 @@ public final class QPollWorker {
                             if(packet.substring(6,8).equals("00")){qDiscoveryAccepted=true;emit("CAPABILITY","已确认控制器接受 Q-Poll 寻卡（0x71）；目标屏通信与刷新需单独验证。");}
                             else emit("CAPABILITY","Q-Poll 寻卡被拒绝，响应状态="+packet.substring(6,8));
                         }
-                        if(line.contains("NxpNciR")&&packet.toUpperCase(java.util.Locale.ROOT).startsWith("4F7001")&&packet.length()>=8&&!cleaned.get()){
-                            String status=packet.substring(6,8);
-                            if(!status.equals("00")){qtagRejection="系统拒绝 QTag，响应状态="+status+"；当前系统未成功开启 Q-Poll。";stopping.set(true);emit("QTAG_REJECTED",qtagRejection);}
+                        if(!cleaned.get()&&line.contains("NxpNciR")&&packet.toUpperCase(java.util.Locale.ROOT).startsWith("4F70")){
+                            String hex=packet.toUpperCase(java.util.Locale.ROOT);
+                            // Layout: 4F (response, GID 0x0F) | 70 (OID) | len | payload..., payload[0] = status.
+                            String status=hex.length()>=8?hex.substring(6,8):"";
+                            emit("QTAG_RESP",hex+(status.isEmpty()?"":" · 状态 "+status+" = "+nciStatusText(status)));
+                            if(!sweepMode&&!status.isEmpty()&&!status.equals("00")){
+                                qtagRejection="系统拒绝 QTag，响应状态="+status+"（"+nciStatusText(status)+"）；当前系统未成功开启 Q-Poll。";
+                                stopping.set(true);emit("QTAG_REJECTED",qtagRejection);
+                            }
                         }
                         if (line.contains("NxpNciX") && packet.startsWith("2103")) emit("RF_TX", packet);
                         if (line.contains("NxpNciR") && (packet.startsWith("4103") || packet.startsWith("6103") || packet.startsWith("6105"))) emit("RF_RX", packet);
@@ -204,7 +264,7 @@ public final class QPollWorker {
         int exit = 0;
         boolean sessionStarted = false;
         try {
-            if ((args.length != 4&&args.length!=5) || !(args[0].equals("inspect") || args[0].equals("qtag") || args[0].equals("qtag-hold") || args[0].equals("standard")||args[0].equals("identity")||args[0].equals("refresh")))
+            if ((args.length != 4&&args.length!=5) || !(args[0].equals("inspect") || args[0].equals("qtag") || args[0].equals("qtag-hold") || args[0].equals("qtag-sweep") || args[0].equals("standard")||args[0].equals("identity")||args[0].equals("refresh")))
                 throw new IllegalArgumentException("Invalid mode or argument count");
             mode=args[0];
             boolean panelOperation=mode.equals("identity")||mode.equals("refresh");
@@ -228,6 +288,13 @@ public final class QPollWorker {
                 setupCallback();
                 Runtime.getRuntime().addShutdownHook(new Thread(QPollWorker::cleanup));
                 startLogcat();
+                if (args[0].equals("qtag-sweep")) {
+                    emit("START", "qtag-sweep:" + seconds);
+                    sessionStarted = true;
+                    qtagTouched = true;
+                    sweepQtag();
+                    return;
+                }
                 // Hold-only mode: switch QTag on and keep it on while the app process polls in the
                 // foreground. This process never calls setReaderMode() -- the framework drops it for
                 // UID 2000 callers without a foreground Activity, so doing it here is pointless.

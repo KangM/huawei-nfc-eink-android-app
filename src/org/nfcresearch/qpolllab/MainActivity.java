@@ -112,6 +112,8 @@ public final class MainActivity extends Activity {
         page.addView(text("上一项由后台进程调用系统接口；本项改由应用自身进程调用同样的接口。两者对照，可判别后台调用是否被系统忽略。",12,0xff68766e));
         page.addView(action("组合测试：QTag + 前台寻卡",v->startCombo()));
         page.addView(text("组合测试把两件事分别交给合适的进程：后台特权进程只负责开启 QTag（Q-Poll 开关），寻卡由本应用前台进程执行。这是绕开「后台调用被系统忽略」的正解。",12,0xff68766e));
+        page.addView(action("QTag 命令探测（只读扫参）",v->start("qtag-sweep")));
+        page.addView(text("上一项会依次试探 7 种厂商命令编码，并把控制器每条原始响应打印出来。它只改读卡器配置，不写屏幕。用途是判定「系统拒绝 QTag」到底是命令编码不对，还是这台机器根本没有该功能。",12,0xff68766e));
         page.addView(text("未读到标签不等于不支持 Q-Poll；成功寻卡也不代表墨水屏供电与刷新已验证。",12,0xff68766e));
         page=pageBodies[1];section(page,"图像与发送");
         page.addView(text("屏幕类型",14,0xff52635d));
@@ -167,10 +169,10 @@ public final class MainActivity extends Activity {
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
         page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
-        page.addView(text("墨水屏刷新测试 · v2.13-combo-test1",12,0xff68766e));
+        page.addView(text("墨水屏刷新测试 · v2.13-combo-test2",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
         selectPage(getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("page",0));
-        append("v2.13-combo-test1 就绪；诊断页含「前台 ReaderMode 对照」与「组合测试：QTag + 前台寻卡」。");source=PanelImage.testPattern();originalSource=source;prepare();
+        append("v2.13-combo-test2 就绪；诊断页含「前台 ReaderMode 对照」「组合测试：QTag + 前台寻卡」「QTag 命令探测」。");source=PanelImage.testPattern();originalSource=source;prepare();
     }
     private void section(LinearLayout page,String title){TextView t=text(title,18,0xff142f2a);t.setTypeface(null,Typeface.BOLD);t.setPadding(0,dp(12),0,dp(6));page.addView(t);}
     private void selectPage(int index){activePage=Math.max(0,Math.min(2,index));for(int i=0;i<3;i++){pageScrolls[i].setVisibility(i==activePage?View.VISIBLE:View.GONE);tabs[i].setTextColor(i==activePage?Color.WHITE:0xff52635d);tabs[i].setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==activePage?0xff176b61:0xffe3eae6));}getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("page",activePage).apply();}
@@ -269,7 +271,9 @@ public final class MainActivity extends Activity {
         if(!line.startsWith("QP|")){if(!line.trim().isEmpty())append(line);return;}
         String[] p=line.split("\\|",3);if(p.length!=3)return;String kind=p[1],message=p[2];
         if(comboMode&&kind.equals("QTAG_ON")&&!comboStarted){comboStarted=true;main.post(this::beginComboScan);}
-        if(comboMode&&!comboStarted&&(kind.equals("ERROR")||kind.equals("QTAG_REJECTED")||kind.equals("CLEANUP_ERROR")))append("组合测试未进入寻卡阶段：QTag 未能开启（见上方该行）。");
+        if(comboMode&&kind.equals("QTAG_REJECTED"))append(comboStarted
+                ?"QTag 被系统拒绝，但前台寻卡照常进行；这一轮的标签来自标准轮询，与 Q-Poll 无关。"
+                :"QTag 被系统拒绝；本轮组合测试会退化为普通前台寻卡。");
         if(kind.equals("CHIP"))chipInfo.setText("芯片："+message);
         if(kind.equals("CAPABILITY"))capabilityInfo.setText("Q-Poll："+message);
         if(kind.equals("QTAG_REJECTED"))capabilityInfo.setText("Q-Poll："+message);
@@ -285,7 +289,9 @@ public final class MainActivity extends Activity {
         if(kind.equals("READY")){state.setText("检查通过");detail.setText("授权 / NFC 可用；这不代表 Q-Poll 已受支持。");terminal=true;}
         if(kind.equals("IDENTITY"))detail.setText(message);
         if(kind.equals("REFRESH_DONE")||kind.equals("REFRESH_UNCONFIRMED")){terminal=true;state.setText(kind.equals("REFRESH_DONE")?"刷新周期已结束 · 请看屏幕":"刷新结果待确认");detail.setText(message);}
-        if(kind.equals("RESULT")){terminal=true;state.setText(message.startsWith("D1")?"屏幕规格校验通过":message.startsWith("已收到")?"寻卡完成":message.startsWith("用户")?"已停止":"未收到标签");detail.setText(message);}
+        if(kind.equals("RESULT")){terminal=true;state.setText(message.startsWith("D1")?"屏幕规格校验通过":message.startsWith("已收到")?"寻卡完成":message.startsWith("枚举完成")?"命令探测结束":message.startsWith("用户")?"已停止":"未收到标签");detail.setText(message);}
+        if(kind.equals("QTAG_RESP"))detail.setText("厂商命令响应：" + message);
+        if(kind.equals("QTAG_SWEEP")){terminal=false;state.setText("探测厂商命令…");detail.setText(message);}
         if(kind.equals("CANCELLED")){terminal=true;state.setText("已停止 · 请检查屏幕画面");detail.setText(message);}
         append(kind+" · "+message);
     }
