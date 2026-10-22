@@ -158,23 +158,48 @@ COM14（PN532 / USB-SERIAL CH340），工具版本 0.1.21。目标为**华为 No
 - PIN 认证成功：`D8=6985` → 验证已知 PIN → `D8=9000`；本仓库 App 已内置该步骤。
 - 配置写入确认成功，`D1=9000`。
 - **传图 53/53 全部 `SW=9000`** —— PN532 + 小线圈完全能完成 105984 字节的传图。
-- `D4=9000` 被接受，随后 DE 查询返回 **`68CA`（低电压告警）**。
+- `D4=9000` 被接受，随后 DE 查询返回 **`68CA`**。
 
-拿日志把时间线对齐后，失败点比「2～3 秒」更明确：
+**这里有一处必须先纠正的误判。** 我此前把它读成「整段刷新里一次 `DE=01` 都没出现，说明波形没撑过起飞阶段」，
+并据此推出「启动阶段欠压」。但去读上游 `device.py` 的 `observe()` 就会发现：
 
+```python
+state = self.exchange(f"{job.name} DE", DE, timeout=..., quiet=True, on_wtx=waiting)
 ```
-[03:11:14] D4: SW=9000            刷新指令已接受
-[03:11:17] DE: SW=68CA            全程 0 次 DE=01（BUSY 从未出现）
+
+`quiet=True` 只压输出，**`require_ok` 仍是默认的 `True`** ⇒ 第一次非 `9000` 就抛错退出。
+所以那行日志不是「观察了 2～3 秒后失败」，而是**采到第一个样本就放弃**。用单个样本推断波形形态不成立，
+`--precharge-ms / --first-de-delay-ms / --de-hz` 之所以「无效」，是因为它们根本没有机会生效。
+
+而同芯片家族的另一个实现（`Chanhee03/epd-nfc-samsung` 的 `FmscEpdProtocol`）把 `68C6` / `68CA` 归为**忙**，
+见到就继续重试。两种语义下结论完全相反，因此必须先把这个岔口测掉：
+
+```powershell
+# 按住射频场一直问，68CA 只记录不计错（只做 D4 + DE，不写 DA/DB、不重传图）
+C:\Users\Chen\.workbuddy\binaries\python\envs\inknfc\Scripts\python.exe ^
+    tools\refresh_hold.py --port COM14 --screen JD79665AA-552x768-BWRY-A1 --seconds 90 --yes
+
+# 上一次刷新可能还在跑，只想看状态：不重发 D4
+... tools\refresh_hold.py --port COM14 --screen JD79665AA-552x768-BWRY-A1 --no-d4 --seconds 60 --yes
+
+# 离线自检判定逻辑（12 项，不需要硬件）
+... tools\refresh_hold.py selftest
 ```
 
-**整段刷新里一次 `DE=01` 都没出现过**，说明波形没撑过起飞阶段：驱动板刚开始建高压就把电压跌穿了，而不是刷到中途才没电。这个区分很关键，它决定了能调什么：
+判读只有四种：
 
-| 形态 | 特征 | 有效手段 | 无效手段 |
-|---|---|---|---|
-| 启动阶段欠压（本机现状） | BUSY 从未出现，D4 后数秒内报错 | 场强 / 耦合：大线圈、对齐、压紧、铁氧体 | 预充电时间、首查延时、`--de-hz` |
-| 中途掉压 | 先 `DE=01` 若干秒，再报错 | 降峰值电流（`--passes two`）+ 增强耦合 | 只改延时 |
+| 结果 | 含义 | 下一步 |
+|---|---|---|
+| `REFRESH_DONE` | 见过忙、随后连续三次空闲 | 刷新本来就通，之前是被上游的异常处理打断了；后续全走这条路 |
+| `HELD_ALL_BUSY` | 全程 `68CA/C6/CB`，一次 `9000` 都没有 | 这才是真的没起来：查场强/耦合，或改用 `--passes two` 降峰值 |
+| `IDLE_NO_BUSY` | 一直空闲，从未启动过刷新 | D4 没真正生效，或图像没落地；回到传图那一步查 |
+| `ABORTED_*` | 出现 `6502` 等其它状态字 | 按真实错误处理（指令不被支持等），与供电无关 |
 
-已把预充电从 1 s 加到 5 s、`--pre-refresh-ms 5000`、`--first-de-delay-ms 3000`、`--de-hz 3` 全试过，**仍在 `68CA` 上失败** —— 与上表的预测一致。
+> **需要知道的上游事实**：`drivers.json` 里本屏 `huawei_a1_jd79665` 的 `experimental=True`，`qualification` 原文是
+> *"Historical inconsistent/partial refresh and power/RF errors; native/half optical success not qualified."*，
+> 而 `hardware_evidence_source` 写的是 *"NOT a new CLI hardware test"*。也就是说**上游自己从未确认过这块屏能透过 NFC 完整刷新成功**。
+> 唯一被记录过的 A1 成功刷新是 PCR532 + 手机原配大线圈 + 板内原厂驱动（见「判定口径」）。
+> 本机现在既没有原配大线圈，原厂驱动也已被早先的写操作覆盖 —— 期望值要按这个前提定。
 
 > **需要知道的上游事实**：`drivers.json` 里本屏 `huawei_a1_jd79665` 的 `experimental=True`，`qualification` 原文是
 > *"Historical inconsistent/partial refresh and power/RF errors; native/half optical success not qualified."*，
@@ -437,49 +462,61 @@ SYSTEM · 配置关键字=已扫描 1 个 libnfc 配置，未出现 QPOLL / EPD 
 | `enableReaderOption` / `isReaderOptionSupported` | realme 自己加的（AOSP 没有），用于息屏 / 后台保持寻卡 | 与唤醒码无关 |
 | `sendVendorNciMessage` | 唯一的厂商命令通道 | 已实测被固件拒绝 |
 
-**手机端若还要能用，只剩「外挂读卡器」一条路**（USB-OTG 接 PN532 或 Chameleon Ultra）。但在此之前先看清真正的墙：
+**手机端若还要能用，只剩「外挂读卡器」一条路**（USB-OTG 接 PN532 或 Chameleon Ultra）。在此之前先看清刷新这一环：
 
-- PC + PN532 已经能发 `7A`、能传完 53/53 帧，却在 `D4` 刷新时 `68CA`（低电压）。
-- 加大 `--precharge-ms`、降低 `--de-hz`、延后首次 `DE` 查询都无效 ⇒ 是**场强 / 耦合**不足，不是时序。
-- 而且早先一次 `send-test` 未带 `--use-stored-driver`，板内 `DA`/`DB` 已被写成上游通用驱动，**原厂驱动不可恢复**。
+- PC + PN532 已经能发 `7A`、能传完 53/53 帧，`D4=9000` 之后第一次 `DE` 查询拿到 `68CA`。
+- 这个 `68CA` **不能当作「刷新失败」的证据**：上游在第一个非 `9000` 状态字上就抛错退出，等于只采了一个样本（详见下一节）。
+- 早先一次 `send-test` 未带 `--use-stored-driver`，板内 `DA`/`DB` 已被写成上游通用驱动，**原厂驱动不可恢复**。
 
-也就是说：把 PN532 挂到手机上，也只能做到「唤醒 + 传图」，刷新照样 `68CA`。**刷新才是当前唯一的真瓶颈，优先级高于「App 怎么发 7A」。**
+也就是说：把 PN532 挂到手机上，也只能做到「唤醒 + 传图」；刷新能不能过，取决于 `tools/refresh_hold.py` 那轮实验 —— 而它还没跑。
 
-## 手机 NFC 直刷（v2.13-phone-nfc-test1 起）
+## 手机 NFC 直刷（v2.13-phone-nfc-test1/2）
 
-前面「NCI 没有位级短帧原语」的结论**只对 Q-Poll 那条路成立**，不能推广成「手机永远刷不了」。两条反证：
+前面「NCI 没有位级短帧原语」的结论只对 Q-Poll 那条路成立，不能推广成「手机永远刷不了」——同芯片家族的
+`Chanhee03/epd-nfc-samsung` 驱动 Waveshare 2.9″ 四色屏时**全程只用公开的 `IsoDep`**。所以值得一试，也确实试了。
 
-1. `Chanhee03/epd-nfc-samsung` 这个安卓 App 驱动的是**同一颗 FMSC ESL 芯片家族**的 Waveshare 2.9″ 四色屏（`F0D2` 传图 / `F0D4` 刷新 / `F0DE` 轮询），**全程只用公开的 `IsoDep`**，没有任何 7 位短帧。
-2. 2026-10-17 起流传的免 root 安卓 APK，实测兼容名单是「红米 K90 Pro/Max ✅、小米 17 Pro ✅（免 root）、三星 Z Flip5 需 Shizuku、小米 14 Ultra / 一加 15 ✗、鸿蒙 ✗」——说明**能不能刷取决于机型的 NFC 场强与栈实现，而不是协议缺原语**。
+### 2026-10-22 实测：这块屏对标准寻卡**完全不可见**
 
-也就是说：**标签本身是能被系统正常发现的**（华为侧的实抓日志里 SAK=0x20、`rw_t4t_select`、ISO_DEP 都在），真正卡住我们的是三处工程细节。
+同一台手机、同一次会话里的两个对照：
 
-### 本次修正的三处
+```
+14:41:07  TAG · UID=AAB59F1F；技术=[NfcA, MifareClassic]；ATQA=0400；SAK=0008   ← 普通卡，立刻读到
+14:41:28  RESULT · 本轮超时，未收到标签（换了墨水屏，10 秒零标签，前后共两次）
+```
 
-| 项 | 之前 | 现在 | 原因 |
-|---|---|---|---|
-| 屏协议运行位置 | 只在后台 worker（UID 2000/0） | **改到应用前台 Activity** | Android 12+ 后台 `setReaderMode` 被静默丢弃，worker 永远等不到标签 |
-| presence check 间隔 | 250 ms | **35 000 ms** | 平台每 ~125 ms 拍一次「还在吗」，这串探询会偷走标签的取电，十几秒的波形中途断连 |
-| `68CA` 语义 | 「低电压或供能不足」→ 立即中止 | **「屏幕忙」→ 继续轮询** | 同芯片家族的两个独立实现都把它当归一化忙态；早先中止它，才让刷新看起来像欠压失败 |
+而 PN532 的并排对照更直接：`--board iphone`（发 `26`/`52`）⇒ `TAG_NOT_FOUND`；`--board huawei`（发 `7A`/`7D`）⇒ `D1=9000`。
 
-另外补了两个开关：`FLAG_READER_SKIP_NDEF_CHECK`（避免厂商 AAR 记录拉起别的 App）和 `FLAG_READER_NO_PLATFORM_SOUNDS`（提示音在某些 ROM 上会瞬时扰动射频场）。
+**结论**：这块屏在收到私有 7 位唤醒帧 `7A`/`7D` 之前，**不回应任何标准寻卡**（`REQA 26` / `WUPA 52`），
+所以它不会进入 ISO14443-4，也不会被任何标准读卡器「看见」。而 Android 的发现流程只会发 `26`/`52`，
+`NfcA.transceive()` 又必须**先有 Tag 对象**才能用、且只能发整字节 —— 两头都堵死。
 
-### 怎么用
+这解释了两件事，也让之前的两个猜测作废：
 
-「图像与发送」页新增两个按钮，**都不需要 Root / Shizuku / 外接读卡器**：
+- 「普通卡能读、墨水屏没反应」**不是场强不足、不是 ROM 限制、也不是贴歪了**，是屏压根没应答。
+- 之前引用华为侧日志里的 `SAK=0x20`、`rw_t4t_select`、`ISO_DEP` 来说「标签本可被发现」是**错的**：
+  那台华为手机已经用 Q-Poll 发过 `7A`，标签是**被唤醒之后**才出现在标准流程里的。
 
-- **手机 NFC 只读检查** —— 只发 `D1`，零写入、零风险。用来确认「系统是否把这块墨水屏交给本应用」。
-- **手机 NFC 刷屏** —— `D1 → D8（必要时 PIN）→ D3 分块 → D4 → DE 轮询` 全流程。
+因此 `v2.13-phone-nfc-test1` 那两个按钮（手机 NFC 只读 / 刷屏）在非华为机型上不可能成功；代码保留，
+但 `v2.13-phone-nfc-test2` 起超时会直接说明这个原因，不再提示「再挪挪位置」。
 
-操作要点：拆掉手机壳后把墨水屏压在机身 NFC 感应区（各机型位置不同，多数在摄像头附近），**全程保持贴合且停留在本应用**，屏幕常亮已自动开启。
+### 仍然属于「用手机刷」的唯一形态：手机 + USB-OTG 外挂读卡器
 
-### 判读
+| 形态 | 手机的角色 | 可行性 |
+|---|---|---|
+| 手机自贴屏 | 读卡器 | ❌ 发不出 `7A`，发现阶段就看不到屏 |
+| 华为手机 + Q-Poll（QTag） | 读卡器 | ✅ 厂商固件自带私有轮询（本仓库 `qtag` 模式就是这条路） |
+| **手机 + OTG 读卡器（PN532 / Chameleon）** | 上位机 | ✅ 协议已全部实测，只差把 PC 那套搬进 App |
 
-- 只读检查出现 `TAG` + `IDENTITY` ⇒ 链路已通，可以试刷屏。
-- 只读检查超时 ⇒ 这台机型/这个贴法没把标签交出来。先换位置（离摄像头远近、垫 1–2 mm），再考虑换机型。
-- 传图几十包后 `D4`/`DE` 报错 ⇒ 场强不足。降复杂度（关抖动、加大色块、改黑白）通常会立刻见效——社区方案里「复杂图要抖两三次才成功」说的就是这个。
+### 已实现的部分（保留）
 
-> ⚠️ 以上是**待实测**结论：代码按同一芯片家族的成熟实现对齐，但尚未在本机墨壳上跑通一轮完整刷屏。
+- 屏协议从后台 worker 搬到**应用前台 Activity**：`PanelSession.run(tag, "refresh"/"identity", …)`
+  （Android 12+ 后台 `setReaderMode` 被静默丢弃，worker 永远等不到标签）。
+- presence check 250 ms → **35 000 ms**：平台每 ~125 ms 的探询会偷走标签取电。
+- `68CA` 由「致命错误」改为「忙 → 继续轮询」；`--passes` 之类的时序参数因此才第一次有机会生效。
+- `FLAG_READER_SKIP_NDEF_CHECK` + `FLAG_READER_NO_PLATFORM_SOUNDS`。
+
+> ⚠️ 上述改动只有在「屏能被发现」的前提下才有意义；本机实测说明在非华为机型上它发现不了。
+> 刷新是否真的能过 `68CA`，改用 `tools/refresh_hold.py` 在 PC 上判定（见「PN532 本机实测结论 · 二」）。
 
 ## 改造路线：绕开 NFC，直接驱动屏（2026-10-22 调研）
 

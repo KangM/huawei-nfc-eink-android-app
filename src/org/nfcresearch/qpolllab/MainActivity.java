@@ -69,9 +69,13 @@ public final class MainActivity extends Activity {
     /** Phone-only panel path: the ISO-DEP protocol runs here, driven by a foreground ReaderMode tag.
      *  No Q-Poll, no root, no Shizuku, no external reader. */
     private volatile boolean phonePanel,phoneHit;
+    /** 本轮有没有读到「普通卡」这种有标签但不带 ISO-DEP 的东西：决定超时文案该给出哪种结论。 */
+    private volatile boolean phoneForeignTag;
     private final Runnable phoneTimeout=new Runnable(){public void run(){
         if(!phonePanel||phoneHit)return;
-        finishPhonePanel("本轮超时，未收到标签：确认墨水屏贴在感应区，并保持本应用在前台。");
+        finishPhonePanel(phoneForeignTag
+                ?"本轮只读到普通卡（无 ISO-DEP），墨水屏一次都没出现。本屏不响应标准寻卡 26/52，只认私有 7 位唤醒帧 7A/7D，而手机 NFC 栈发不出位级短帧，所以它在手机上始终不可见——与贴合位置无关。"
+                :"本轮没读到任何标签。请先用普通卡验证一次：能读到就说明链路正常，本屏同样是因为「只认 7A/7D、手机栈发不出 7 位帧」而不出现；连普通卡都读不到才需要挪位置。");
     }};
     private int foregroundStage,foregroundStageSeconds;
     private android.app.PendingIntent dispatchIntent;
@@ -202,10 +206,10 @@ public final class MainActivity extends Activity {
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
         page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
-        page.addView(text("墨水屏刷新测试 · v2.13-phone-nfc-test1",12,0xff68766e));
+        page.addView(text("墨水屏刷新测试 · v2.13-phone-nfc-test2",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
         selectPage(getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("page",0));
-        append("v2.13-phone-nfc-test1 就绪；「图像与发送」页新增手机 NFC 只读 / 刷屏，屏协议在前台进程内直跑 ISO-DEP。");source=PanelImage.testPattern();originalSource=source;prepare();
+        append("v2.13-phone-nfc-test2 就绪；超时提示改为区分「只读到普通卡」与「什么都没读到」，并说明本屏只认 7A/7D 唤醒。");source=PanelImage.testPattern();originalSource=source;prepare();
     }
     private void section(LinearLayout page,String title){TextView t=text(title,18,0xff142f2a);t.setTypeface(null,Typeface.BOLD);t.setPadding(0,dp(12),0,dp(6));page.addView(t);}
     private void selectPage(int index){activePage=Math.max(0,Math.min(2,index));for(int i=0;i<3;i++){pageScrolls[i].setVisibility(i==activePage?View.VISIBLE:View.GONE);tabs[i].setTextColor(i==activePage?Color.WHITE:0xff52635d);tabs[i].setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==activePage?0xff176b61:0xffe3eae6));}getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("page",activePage).apply();}
@@ -484,7 +488,7 @@ public final class MainActivity extends Activity {
         final File jobFile,imageFile;
         try{File[] files=buildPhoneJob(id,write);jobFile=files[0];imageFile=files[1];}
         catch(Exception e){append("准备失败："+e);return;}
-        stopFile=stop;busy=true;phonePanel=true;phoneHit=false;terminal=false;scanning=false;failure.clear();
+        stopFile=stop;busy=true;phonePanel=true;phoneHit=false;phoneForeignTag=false;terminal=false;scanning=false;failure.clear();
         controls();progress.setProgress(0);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         append("──────── "+(write?"phone-refresh · 手机 NFC 刷屏":"phone-identity · 手机 NFC 只读")+" ────────");
@@ -522,8 +526,10 @@ public final class MainActivity extends Activity {
         android.nfc.tech.NfcA nfcA=android.nfc.tech.NfcA.get(tag);
         if(nfcA!=null){StringBuilder atqa=new StringBuilder();for(byte b:nfcA.getAtqa())atqa.append(String.format("%02X",b&255));
             event("QP|META|ATQA="+atqa+"；SAK="+String.format("%04X",nfcA.getSak()&0xffff));}
-        if(android.nfc.tech.IsoDep.get(tag)==null)
+        if(android.nfc.tech.IsoDep.get(tag)==null){
+            phoneForeignTag=true;
             event("QP|ERROR|该标签没有 ISO-DEP，屏协议无法继续；请确认贴的是墨水屏而不是普通卡。");
+        }
         append("──────── 屏协议开始（前台进程内，ISO-DEP）────────");
         progress.setProgress(0);
         new Thread(()->{
