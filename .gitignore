@@ -11,3 +11,8 @@ __pycache__/
 /tmp-probe-*.log
 /local.properties
 /.workbuddy/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/

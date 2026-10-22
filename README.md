@@ -699,6 +699,37 @@ SYSTEM · 配置关键字=已扫描 1 个 libnfc 配置，未出现 QPOLL / EPD 
 
 成本参考：手机壳 15～30 元（**屏幕只要 15～20 元**），ESP32-C3 模组 10～20 元。若要做改造实验，建议另外买一只壳，别拿手上这只当试验品。
 
+## 接线自检固件：`firmware/epd-wiring-test`
+
+线路接到 ESP32-C3 之后，第一件事不是做播放器，而是先确认**八根线接对没有**。
+这个 PlatformIO 工程就是干这个的（板：AirM2M Core C3 / `airm2m_core_esp32c3`）：
+
+```powershell
+cd firmware/epd-wiring-test
+pio run -t upload
+pio device monitor            # 115200
+```
+
+它按阶段打日志，任何一步失败就停下并指出该量哪根线：
+
+| 阶段 | 验证的是 | 失败即说明 |
+|---|---|---|
+| 1 BUSY 空闲采样 | 引脚是否浮空 | BUSY（IO10）没接好 |
+| 2 硬复位 + 等 BUSY | RST 与供电 | RST（IO2）、3V3、GND |
+| 3 写 14 条初始化寄存器 | SCK / DIN / DC / CS | 四根数据线里有断的 |
+| 4 PON，等 BUSY 释放 | 升压能否点亮 | 供电吃不住峰值 |
+| 5 传 600×200 字节 | 数据通路 | 传得完就说明 SPI 通了 |
+| 6 DRF，等 BUSY 释放 | 真正出画面 | 8 s 内 BUSY 不拉低 = 控制器没收到有效 SPI |
+
+测试图（黑边 + 四色块 + 棋盘格 + 竖条纹 + 1px 细线 + 可读文字 + 角标）覆盖了
+「颜色 / 横向寻址 / 纵向寻址 / 方向」四件事，一眼能看出坏在哪一类。
+预览图见 `docs/wiring-test-preview.png`，它由 `tools/preview_wiring_test.py`
+直接解析 `main.cpp` 的版面常量渲染，改代码图会跟着变。
+
+寄存器序列取自公开社区实现（三个来源一致），但**那些仓库都没有 LICENSE**，
+因此本仓库只借鉴寄存器取值这一硬件事实，驱动分层、测试图与字库均自行编写。
+细节与排错表见 [`firmware/epd-wiring-test/README.md`](firmware/epd-wiring-test/README.md)。
+
 ## GitHub Actions 自动构建
 
 仓库里有 `.github/workflows/build-apk.yml`，不需要 Gradle —— 流水线就是「装 JDK + 补齐 build-tools → `python3 build.py`」。
