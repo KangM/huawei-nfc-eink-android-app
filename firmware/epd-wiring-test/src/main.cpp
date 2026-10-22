@@ -309,24 +309,28 @@ static void epd_cmd_data(uint8_t c, const uint8_t *d, size_t n) {
 /* ---------------------------------------------------------------- BUSY --- */
 static int busy_level(void) { return digitalRead(PIN_EPD_BUSY); }
 
-/* 等 BUSY 变成空闲。saw_busy 带回"中途是否真的观察到过忙"，
- * 这是区分"屏没反应"和"屏在干活"的关键。 */
-static bool wait_busy_ready(uint32_t timeout_ms, bool *saw_busy, uint32_t *waited_ms) {
+/* 三种结局必须分开报，否则"一直低"会被误读成"忙过又空闲"。
+ * （v1 就踩过这个坑：超时时把 saw 置真，日志打印成"先忙后闲"。） */
+enum BusyWait {
+    BUSY_OK,           /* 先低（忙）后高（闲）：控制器真的干过活 */
+    BUSY_NEVER_LOW,    /* 全程高：忙信号从没出现 */
+    BUSY_STUCK_LOW,    /* 全程低：BUSY 一直被拉低，从未释放 */
+};
+
+static BusyWait wait_busy_ready(uint32_t timeout_ms, uint32_t *waited_ms) {
     uint32_t t0 = millis();
-    bool busy = false;
+    bool saw_low = false;
     while (millis() - t0 < timeout_ms) {
         if (busy_level() != BUSY_READY) {
-            busy = true;
-        } else if (busy) {
-            if (saw_busy) *saw_busy = true;
+            saw_low = true;
+        } else if (saw_low) {
             if (waited_ms) *waited_ms = millis() - t0;
-            return true;
+            return BUSY_OK;
         }
         delay(1);
     }
-    if (saw_busy) *saw_busy = busy;
     if (waited_ms) *waited_ms = millis() - t0;
-    return !busy;   /* 一直空闲也算"就绪"，但调用方要靠 saw_busy 判断有没有做事 */
+    return saw_low ? BUSY_STUCK_LOW : BUSY_NEVER_LOW;
 }
 
 static bool wait_busy_assert(uint32_t timeout_ms, uint32_t *waited_ms) {
@@ -340,16 +344,6 @@ static bool wait_busy_assert(uint32_t timeout_ms, uint32_t *waited_ms) {
     }
     if (waited_ms) *waited_ms = millis() - t0;
     return false;
-}
-
-/* ----------------------------------------------------------------- 复位 --- */
-static void hw_reset(void) {
-    digitalWrite(PIN_EPD_RST, HIGH);
-    delay(20);
-    digitalWrite(PIN_EPD_RST, LOW);
-    delay(10);
-    digitalWrite(PIN_EPD_RST, HIGH);
-    delay(20);
 }
 
 /* -------------------------------------------------------------- 初始化表 --- */
@@ -426,23 +420,49 @@ static uint32_t send_frame(int page) {
 }
 
 /* ---------------------------------------------------------------- 刷新 --- */
+/* 盲刷：完全不看 BUSY，按固定时长推进。
+ * 用途是把"BUSY 这根线坏了"和"整条链路都不通"分开 —— 若盲刷能出图，
+ * 说明只有 BUSY 一根线有问题，其余七根都对。 */
+static bool g_blind = false;
+
 static bool power_on(void) {
-    bool saw = false;
+    if (g_blind) {
+        epd_cmd(CMD_PON);
+        delay(300);
+        Serial.println("      [盲刷] PON 已发，固定等 300 ms（不看 BUSY）");
+        return true;
+    }
     uint32_t ms = 0;
     epd_cmd(CMD_PON);
-    bool ok = wait_busy_ready(6000, &saw, &ms);
-    Serial.printf("      PON 后 BUSY: %s，耗时 %u ms\n",
-                  saw ? "先忙后闲" : "未见忙（可能已立刻完成）", (unsigned)ms);
-    return ok && (saw || ms < 6000);
+    BusyWait r = wait_busy_ready(6000, &ms);
+    switch (r) {
+        case BUSY_OK:
+            Serial.printf("      PON ok：BUSY 先忙后闲，%u ms\n", (unsigned)ms);
+            return true;
+        case BUSY_NEVER_LOW:
+            Serial.println("      PON: BUSY 全程为高，没看到忙 —— 控制器可能根本没收到 PON");
+            Serial.println("           → 先查 SCK(IO4)/DIN(IO6)/DC(IO1)/CS(IO7)");
+            return false;
+        case BUSY_STUCK_LOW:
+        default:
+            Serial.printf("      PON: BUSY 一直为低，%u ms 都没释放\n", (unsigned)ms);
+            Serial.println("           → 屏处在复位态/没上电，或 BUSY 被下拉。见 [1/6][2/6] 的判别结论");
+            return false;
+    }
 }
 
 static bool display_refresh(void) {
     uint8_t zero = 0x00;
-    bool saw = false;
     uint32_t ms = 0;
     set_full_window();
     epd_cmd(CMD_DRF);
     epd_data(&zero, 1);
+
+    if (g_blind) {
+        Serial.println("      [盲刷] DRF 已发，固定等 25 秒（四色全刷通常 15~25 秒）");
+        delay(25000);
+        return true;
+    }
 
     uint32_t assert_ms = 0;
     bool asserted = wait_busy_assert(8000, &assert_ms);
@@ -450,9 +470,13 @@ static bool display_refresh(void) {
                   (unsigned)assert_ms, asserted ? "拉低（开始刷新）" : "没有拉低");
     if (!asserted) return false;
 
-    bool ok = wait_busy_ready(90000, &saw, &ms);
-    Serial.printf("      刷新结束，用时 %u ms\n", (unsigned)(assert_ms + ms));
-    return ok;
+    BusyWait r = wait_busy_ready(90000, &ms);
+    if (r == BUSY_OK) {
+        Serial.printf("      刷新结束，用时 %u ms\n", (unsigned)(assert_ms + ms));
+        return true;
+    }
+    Serial.printf("      DRF 后 BUSY 没有释放（%u ms）：波形可能没真正跑起来\n", (unsigned)ms);
+    return false;
 }
 
 static bool power_off(void) {
@@ -462,10 +486,13 @@ static bool power_off(void) {
     /* POF 的忙脉冲很短，有一部分固件根本不拉低 BUSY。
      * 先短等一次"有没有忙"，没有就立刻返回，避免每刷一页白等 6 秒。 */
     uint32_t ms = 0;
+    if (g_blind) {
+        delay(300);
+        return true;
+    }
     if (wait_busy_assert(1500, &ms)) {
-        bool saw = false;
         uint32_t waited = 0;
-        wait_busy_ready(6000, &saw, &waited);
+        wait_busy_ready(6000, &waited);
     }
     return true;
 }
@@ -479,6 +506,7 @@ static bool show_page(int page) {
 
     if (!power_on()) {
         Serial.println("  !! PON 没有正常完成：优先查 VDD/3V3 供电、BUSY(IO10)、RST(IO2)");
+        Serial.println("  >> 若想确认「是不是只有 BUSY 一根线坏了」，按 x 盲刷（忽略 BUSY，约 26 秒）");
         return false;
     }
 
@@ -509,20 +537,72 @@ static void banner(void) {
     Serial.printf("  SPI=%d Hz, PSR=0x%02X%s, 控制器帧 %dx%d\n", EPD_SPI_HZ, EPD_PSR_VALUE,
                   (EPD_PSR_VALUE == EPD_PSR_FLIP) ? " (翻转)" : "", PHY_W, PHY_H);
     Serial.println("  屏幕上应该是：黑边 + 四色块 + 文字 WIRING OK");
-    Serial.println("  按 p=测试图  b=全黑  w=全白  c=循环");
+    Serial.println("  按 p=测试图  b=全黑  w=全白  c=循环  x=盲刷  d=重判 BUSY  r=重复位");
     Serial.println("----------------------------------------------");
 }
 
-/* BUSY 一直在变说明引脚浮空（没接上），稳定的电平才可信 */
-static void check_busy_idle(void) {
+/* 阶段 1：判别 BUSY 这根线到底是"没接上"还是"被外面拉住"。
+ * 手法是打开 ESP32 内部上拉（约 45k）再读一次：
+ *   · 浮空读 0、上拉后读 1  -> 线是断的 / 假焊（上拉能拉起来，说明对面什么都没接）
+ *   · 上拉后仍然读 0        -> 被外部强行拉低：屏在复位态主动拉低，或线对地短路
+ *   · 两次都读 1            -> 正常空闲（JD79665 高=空闲）
+ */
+static void check_busy_line(void) {
+    pinMode(PIN_EPD_BUSY, INPUT);
+    delay(3);
+    int floating = busy_level();
+
     int high = 0;
     for (int i = 0; i < 32; ++i) {
         if (busy_level() == BUSY_READY) high++;
         delay(2);
     }
-    Serial.printf("[1/6] BUSY 空闲采样：32 次里 %d 次为高（1=空闲）\n", high);
-    if (high != 0 && high != 32) {
-        Serial.println("      !! 电平在跳变，BUSY(IO10) 可能没接上或接触不良");
+
+    pinMode(PIN_EPD_BUSY, INPUT_PULLUP);
+    delay(3);
+    int pulled = busy_level();
+    pinMode(PIN_EPD_BUSY, INPUT);
+
+    Serial.printf("[1/6] BUSY 线路判别：浮空读 %d，32 次里 %d 次为高，内部上拉后读 %d\n",
+                  floating, high, pulled);
+
+    if (floating == 0 && pulled == 1) {
+        Serial.println("      >> 结论：BUSY 这根线基本是断的（上拉能拉起来 = 对面没接东西）");
+        Serial.println("         量 IO10 到屏 BUSY 的通断；这种状态下的忙/闲读数全不可信");
+    } else if (pulled == 0) {
+        Serial.println("      >> 结论：BUSY 被外部拉低（45k 上拉拉不动）");
+        Serial.println("         两种可能：① 屏在复位态主动拉低 ② 这根线对 GND 短路");
+        Serial.println("         若下面 [2/6] 放开 RST 后仍不升高，优先怀疑 RST 没接到屏");
+    } else if (high != 32) {
+        Serial.println("      >> 结论：电平在跳，接触不良（先重焊 BUSY）");
+    } else {
+        Serial.println("      >> 结论：空闲电平正常");
+    }
+}
+
+/* 阶段 2：复位后跟踪 BUSY 轨迹。RST 真的接到了屏，放开后必须看到 0->1 的跳变。 */
+static void reset_and_trace(void) {
+    digitalWrite(PIN_EPD_RST, HIGH);
+    delay(20);
+    digitalWrite(PIN_EPD_RST, LOW);
+    delay(50);
+    digitalWrite(PIN_EPD_RST, HIGH);
+
+    char trace[129];
+    int n = 0, first_high = -1;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 500 && n < 128) {
+        int lv = busy_level();
+        trace[n++] = (lv == BUSY_READY) ? '1' : '0';
+        if (lv == BUSY_READY && first_high < 0) first_high = (int)(millis() - t0);
+        delay(2);
+    }
+    trace[n] = 0;
+    Serial.printf("      复位后 500ms 内 BUSY 轨迹（每 2ms 一点）：%s\n", trace);
+    if (first_high < 0) {
+        Serial.println("      >> 放开 RST 后 BUSY 一直没升高 ⇒ RST(IO2) 大概没接到屏，或屏没供电");
+    } else {
+        Serial.printf("      >> BUSY 在 %d ms 释放，复位通路正常\n", first_high);
     }
 }
 
@@ -535,27 +615,15 @@ void setup() {
     pinMode(PIN_EPD_CS, OUTPUT);   digitalWrite(PIN_EPD_CS, HIGH);
     pinMode(PIN_EPD_DC, OUTPUT);   digitalWrite(PIN_EPD_DC, HIGH);
     pinMode(PIN_EPD_RST, OUTPUT);  digitalWrite(PIN_EPD_RST, HIGH);
-    pinMode(PIN_EPD_BUSY, INPUT);  /* 屏侧自己驱动，不要上拉，避免掩盖浮空 */
+    pinMode(PIN_EPD_BUSY, INPUT);  /* 屏侧自己驱动，常态不上拉，避免掩盖浮空 */
 
-    check_busy_idle();
+    check_busy_line();
 
     SPI.begin(PIN_EPD_SCK, -1, PIN_EPD_MOSI, -1);
     SPI.beginTransaction(SPISettings(EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
 
-    Serial.println("[2/6] 硬复位：RST 高 20ms -> 低 10ms -> 高 20ms");
-    hw_reset();
-    {
-        bool saw = false;
-        uint32_t ms = 0;
-        bool ok = wait_busy_ready(3000, &saw, &ms);
-        Serial.printf("      复位后 BUSY: %s（%u ms）\n",
-                      saw ? "先忙后闲 = 正常" : "一直空闲 = 控制器可能没复位", (unsigned)ms);
-        if (!ok) {
-            Serial.println("      !! BUSY 一直是低：先查 3V3/GND、RST(IO2)、BUSY(IO10)");
-            Serial.println("      !! 若 BUSY 与 GND 短路也会这样，用万用表量一下");
-            Serial.println("      仍然继续尝试初始化，看能不能出图。");
-        }
-    }
+    Serial.println("[2/6] 硬复位：RST 高 20ms -> 低 50ms -> 高");
+    reset_and_trace();
 
     Serial.println("[3/6] 写初始化寄存器表（14 条）");
     panel_init();
@@ -576,7 +644,25 @@ void loop() {
         return;
     }
     int c = Serial.read();
-    if (c == 'p' || c == 'P')      show_page(PAGE_PATTERN);
+    if (c == 'x' || c == 'X') {
+        Serial.println("\n>>> 盲刷模式：完全忽略 BUSY，按固定时长推进 <<<");
+        g_blind = true;
+        show_page(PAGE_BLACK);        /* 先全黑：整屏变色最容易看出来 */
+        delay(2000);
+        show_page(PAGE_PATTERN);
+        g_blind = false;
+    }
+    else if (c == 'd' || c == 'D') {
+        /* 现场用：把屏那一侧的 BUSY 线拔掉再按 d，对比读数就能分清
+         * "线断了" 和 "屏在拉低" */
+        Serial.println("\n[重新判别] BUSY 线路");
+        check_busy_line();
+    }
+    else if (c == 'r' || c == 'R') {
+        Serial.println("\n[重新复位] 跟踪 BUSY 轨迹");
+        reset_and_trace();
+    }
+    else if (c == 'p' || c == 'P')      show_page(PAGE_PATTERN);
     else if (c == 'b' || c == 'B') show_page(PAGE_BLACK);
     else if (c == 'w' || c == 'W') show_page(PAGE_WHITE);
     else if (c == 'c' || c == 'C') {
@@ -588,6 +674,6 @@ void loop() {
     } else if (c == '\r' || c == '\n') {
         /* 忽略回车 */
     } else {
-        Serial.println("p=测试图  b=全黑  w=全白  c=循环");
+        Serial.println("p=测试图  b=全黑  w=全白  c=循环  x=盲刷  d=重判 BUSY  r=重复位");
     }
 }
