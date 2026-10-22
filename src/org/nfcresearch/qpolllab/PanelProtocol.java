@@ -11,6 +11,8 @@ import java.util.Map;
 public final class PanelProtocol {
     public static final int WIDTH=552, HEIGHT=768, IMAGE_BYTES=105984;
     public static final int DEFAULT_POLL_MS=500;
+    /** 68CA is the panel saying "busy", not "starved": polling must continue, never abort. */
+    public static final int SW_BUSY=0x68CA;
     public static final byte[] D1=hex("00D1000000"), D8=hex("F0D8000005000000000E"), DE=hex("F0DE000001");
     private static final byte[] PIN=hex("00200001055265699919");
     private static final byte[] GEOMETRY=hex("F0C72006000228"), SCAN=hex("00120030FFFFFF");
@@ -41,7 +43,8 @@ public final class PanelProtocol {
     }
     private static String meaning(int sw) {
         switch(sw) {
-            case 0x6502:case 0x68CA:case 0x698A:return "低电压或供能不足";
+            case 0x6502:case 0x698A:return "低电压或供能不足";
+            case 0x68CA:return "屏幕忙（刷新进行中或资源被占用），应继续轮询而不是中止";
             case 0x68CB:return "屏幕刷新超时";
             case 0x6992:return "数据解压失败";
             case 0x6993:return "解压后的数据长度错误";
@@ -173,13 +176,27 @@ public final class PanelProtocol {
         }
         control.event("STAGE","refreshing|图片已传完，正在启动屏幕刷新");
         control.check();
-        requireOk(exchange(refresh,"D4 刷新（上电等待 "+powerMs+" ms）",8000,true),"D4");
+        // 68CA on D4 means "busy", not "out of power": the same chip family documents it as a
+        // transient state to be polled through (CompassSecurity/nfcink, fossasia/magic-epaper-app).
+        // Aborting on it was the reason earlier runs looked like an undervoltage failure.
+        byte[] refreshResponse=exchange(refresh,"D4 刷新（上电等待 "+powerMs+" ms）",8000,false);
+        if(status(refreshResponse)==SW_BUSY)
+            control.event("REFRESH_BUSY","D4 返回 68CA＝屏幕忙（上一次刷新可能仍在进行）；转入忙状态轮询，不重发 D4");
+        else requireOk(refreshResponse,"D4");
         long started=control.now(),deadline=started+90000;
-        boolean busySeen=false;int idle=0;Boolean previous=null;
+        boolean busySeen=false;int idle=0,busyCodePolls=0;Boolean previous=null;
         control.event("STAGE","polling|保持贴合供能，等待屏幕刷新");
         while(control.now()<deadline) {
-            byte[] data=requireOk(exchange(DE,"DE 状态查询",5000,true),"DE");
+            byte[] raw=exchange(DE,"DE 状态查询",5000,false);
+            if(status(raw)==SW_BUSY) {
+                // The tag answers "busy" instead of a busy byte while the waveform owns the panel.
+                busyCodePolls++;busySeen=true;idle=0;
+                if(previous==null||!previous){control.event("BUSY","屏幕返回 68CA（忙），继续供能");previous=Boolean.TRUE;}
+                pause(pollMs);continue;
+            }
+            byte[] data=requireOk(raw,"DE");
             if(data.length!=1||(data[0]!=0&&data[0]!=1))throw new IllegalArgumentException("DE 没有有效忙状态字节");
+            busyCodePolls=0;
             boolean busy=data[0]==1;busySeen|=busy;idle=busy?0:idle+1;
             if(previous==null||previous!=busy){control.event("BUSY",busy?"屏幕报告忙，继续供能":"屏幕报告空闲");previous=busy;}
             if(!busy&&idle>=3&&(busySeen||control.now()-started>=20000)) {
@@ -189,6 +206,10 @@ public final class PanelProtocol {
                 return busySeen;
             }
             pause(pollMs);
+        }
+        if(busyCodePolls>0) {
+            control.event("REFRESH_UNCONFIRMED","DE 全程返回 68CA（忙）直到轮询窗口结束；请目视确认画面是否已更新");
+            return false;
         }
         throw new IllegalStateException("刷新状态等待超过 90 秒；未自动重发 D4");
     }

@@ -66,6 +66,13 @@ public final class MainActivity extends Activity {
     private boolean scanning,terminal;
     private android.nfc.NfcAdapter foregroundAdapter;
     private volatile boolean foregroundScan,foregroundHit;
+    /** Phone-only panel path: the ISO-DEP protocol runs here, driven by a foreground ReaderMode tag.
+     *  No Q-Poll, no root, no Shizuku, no external reader. */
+    private volatile boolean phonePanel,phoneHit;
+    private final Runnable phoneTimeout=new Runnable(){public void run(){
+        if(!phonePanel||phoneHit)return;
+        finishPhonePanel("本轮超时，未收到标签：确认墨水屏贴在感应区，并保持本应用在前台。");
+    }};
     private int foregroundStage,foregroundStageSeconds;
     private android.app.PendingIntent dispatchIntent;
     /** Four ways to register for tag discovery, tried in order. If none of them sees a plain tag,
@@ -179,6 +186,9 @@ public final class MainActivity extends Activity {
         panelType.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putString("panelType",selectedPanelType()).apply();prepare();}public void onNothingSelected(AdapterView<?> p){}});
         fit.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){prepare();}public void onNothingSelected(AdapterView<?> p){}});
         page.addView(action("只读检查屏幕",v->start("identity")));
+        page.addView(action("手机 NFC 只读检查（前台，无需 Root）",v->startPhonePanel(false)));
+        page.addView(action("手机 NFC 刷屏（前台，无需 Root）",v->startPhonePanel(true)));
+        page.addView(text("这两项只用手机自带 NFC 与公开接口：前台 ReaderMode 收到标签后，D1 / D8 / D3 / D4 / DE 直接在本进程内跑 ISO-DEP。不需要 Q-Poll、不需要 Root、不需要外接读卡器。刷屏期间必须保持贴合且停留在本应用。",12,0xff68766e));
         page.addView(text("支持相同原厂配置的 552×768 四色屏。发送时持续贴合并保持应用在前台；切换本应用内的页面不会中断操作。",12,0xff68766e));
         page=pageBodies[2];section(page,"高级参数");
         page.addView(text("参数用于下一次发送，运行期间锁定。",12,0xff68766e));
@@ -192,10 +202,10 @@ public final class MainActivity extends Activity {
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
         page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
-        page.addView(text("墨水屏刷新测试 · v2.13-combo-test5",12,0xff68766e));
+        page.addView(text("墨水屏刷新测试 · v2.13-phone-nfc-test1",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
         selectPage(getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("page",0));
-        append("v2.13-combo-test5 就绪；前台寻卡改为四种注册方式逐段对照，用来定位「普通卡也读不到」。");source=PanelImage.testPattern();originalSource=source;prepare();
+        append("v2.13-phone-nfc-test1 就绪；「图像与发送」页新增手机 NFC 只读 / 刷屏，屏协议在前台进程内直跑 ISO-DEP。");source=PanelImage.testPattern();originalSource=source;prepare();
     }
     private void section(LinearLayout page,String title){TextView t=text(title,18,0xff142f2a);t.setTypeface(null,Typeface.BOLD);t.setPadding(0,dp(12),0,dp(6));page.addView(t);}
     private void selectPage(int index){activePage=Math.max(0,Math.min(2,index));for(int i=0;i<3;i++){pageScrolls[i].setVisibility(i==activePage?View.VISIBLE:View.GONE);tabs[i].setTextColor(i==activePage?Color.WHITE:0xff52635d);tabs[i].setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==activePage?0xff176b61:0xffe3eae6));}getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("page",activePage).apply();}
@@ -443,6 +453,101 @@ public final class MainActivity extends Activity {
         busy=false;controls();
         try{getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}catch(Throwable ignored){}
     }
+    /** Builds the job bundle {@link PanelSession} expects; only the refresh path carries an image. */
+    private File[] buildPhoneJob(String id,boolean withImage)throws Exception{
+        File jobFile=new File(getFilesDir(),"job-"+id+".json"), imageFile=new File(getFilesDir(),"image-"+id+".bin");
+        JSONObject job=new JSONObject();
+        if(withImage){
+            byte[] image=prepared.packed.clone();
+            try(FileOutputStream out=new FileOutputStream(imageFile)){out.write(image);}
+            String sha=PanelProtocol.toHex(MessageDigest.getInstance("SHA-256").digest(image));
+            job.put("panelType",prepared.panelType);
+            job.put("imageFile",imageFile.getAbsolutePath());
+            job.put("sha256",sha);
+            job.put("powerMs",powerTimes[power.getSelectedItemPosition()]);
+            job.put("pollMs",pollTimes[poll.getSelectedItemPosition()]);
+            append("图片参数："+prepared.settings);
+            append("预览快照 SHA-256="+sha);
+        }
+        try(FileOutputStream out=new FileOutputStream(jobFile)){out.write(job.toString().getBytes("UTF-8"));}
+        return new File[]{jobFile,imageFile};
+    }
+    /** Phone-as-the-only-tool path. The blocker that killed the Q-Poll route was never the RF link:
+     *  it was that a background caller's setReaderMode() is silently dropped. Here the tag is
+     *  delivered to a resumed Activity, and the very same PanelSession then runs in this process. */
+    private void startPhonePanel(final boolean write){
+        if(busy||preparing||editingCrop||!resumed)return;
+        if(write&&(prepared==null||prepared.panelType.isEmpty())){append("请先在本页选择屏幕类型 A0 或 A1。");return;}
+        final int seconds=durations[duration.getSelectedItemPosition()];
+        final String id=Long.toString(SystemClock.elapsedRealtime());
+        final File stop=new File(getFilesDir(),"stop-"+id);
+        final File jobFile,imageFile;
+        try{File[] files=buildPhoneJob(id,write);jobFile=files[0];imageFile=files[1];}
+        catch(Exception e){append("准备失败："+e);return;}
+        stopFile=stop;busy=true;phonePanel=true;phoneHit=false;terminal=false;scanning=false;failure.clear();
+        controls();progress.setProgress(0);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        append("──────── "+(write?"phone-refresh · 手机 NFC 刷屏":"phone-identity · 手机 NFC 只读")+" ────────");
+        foregroundAdapter=android.nfc.NfcAdapter.getDefaultAdapter(this);
+        if(foregroundAdapter==null){append("FRAMEWORK · 本机没有可用的 NFC 适配器。");finishPhonePanel(null);return;}
+        boolean granted=checkSelfPermission("android.permission.NFC")==android.content.pm.PackageManager.PERMISSION_GRANTED;
+        append("FRAMEWORK · 执行身份 UID="+android.os.Process.myUid()+"（应用进程，Activity 前台）；NFC 已启用="
+                +foregroundAdapter.isEnabled()+"；NFC 权限="+(granted?"已授予":"未授予"));
+        try{
+            android.os.Bundle extras=new android.os.Bundle();
+            // The platform pings a present tag every ~125 ms by default. During a ~16 s waveform those
+            // pings steal power from the tag's harvester and drop the session, so push the interval out.
+            extras.putInt(android.nfc.NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY,35000);
+            // No NDEF probe (the vendor record would launch nothing useful) and no platform beep:
+            // the beep itself can interrupt the field on some ROMs.
+            int flags=android.nfc.NfcAdapter.FLAG_READER_NFC_A
+                    |android.nfc.NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
+                    |android.nfc.NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS;
+            foregroundAdapter.enableReaderMode(this,tag->{
+                if(phoneHit)return;
+                phoneHit=true;
+                main.post(()->{if(!destroyed)beginPhoneSession(tag,write,jobFile,imageFile,stop);});
+            },flags,extras);
+        }catch(Throwable e){append("FRAMEWORK · 启用 ReaderMode 失败："+e);finishPhonePanel(null);return;}
+        event("QP|START|phone:"+seconds);
+        state.setText(write?"手机 NFC 刷屏":"手机 NFC 只读");
+        detail.setText("把墨水屏贴到感应区并保持不动；"+seconds+" 秒内没有标签会结束。");
+        main.postDelayed(phoneTimeout,seconds*1000L);
+    }
+    private void beginPhoneSession(final android.nfc.Tag tag,final boolean write,final File jobFile,final File imageFile,final File stop){
+        main.removeCallbacks(phoneTimeout);
+        StringBuilder uid=new StringBuilder();
+        for(byte b:tag.getId())uid.append(String.format("%02X",b&255));
+        event("QP|TAG|收到标签 UID="+uid+"；技术="+java.util.Arrays.toString(tag.getTechList()));
+        android.nfc.tech.NfcA nfcA=android.nfc.tech.NfcA.get(tag);
+        if(nfcA!=null){StringBuilder atqa=new StringBuilder();for(byte b:nfcA.getAtqa())atqa.append(String.format("%02X",b&255));
+            event("QP|META|ATQA="+atqa+"；SAK="+String.format("%04X",nfcA.getSak()&0xffff));}
+        if(android.nfc.tech.IsoDep.get(tag)==null)
+            event("QP|ERROR|该标签没有 ISO-DEP，屏协议无法继续；请确认贴的是墨水屏而不是普通卡。");
+        append("──────── 屏协议开始（前台进程内，ISO-DEP）────────");
+        progress.setProgress(0);
+        new Thread(()->{
+            try{
+                PanelSession.run(tag,write?"refresh":"identity",jobFile,stop,
+                        (kind,message)->main.post(()->{if(!destroyed)event("QP|"+kind+"|"+message);}));
+                main.post(()->{if(!destroyed)event("QP|RESULT|"+(write?"手机 NFC 刷屏流程已结束，请目视确认画面":"手机 NFC 只读检查通过"));});
+            }catch(Throwable e){
+                main.post(()->{if(!destroyed)event("QP|ERROR|手机 NFC 会话失败："+e);});
+            }finally{
+                main.post(()->{jobFile.delete();imageFile.delete();finishPhonePanel(null);});
+            }
+        },"phone-panel").start();
+    }
+    private void finishPhonePanel(String reason){
+        boolean was=phonePanel;
+        phonePanel=false;phoneHit=false;
+        main.removeCallbacks(phoneTimeout);
+        if(foregroundAdapter!=null)try{foregroundAdapter.disableReaderMode(this);}catch(Throwable ignored){}
+        if(stopFile!=null){try{stopFile.delete();}catch(Exception ignored){}}
+        if(was&&reason!=null&&!terminal){terminal=true;event("QP|RESULT|手机 NFC 本轮结束："+reason);}
+        busy=false;controls();
+        try{getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);}catch(Throwable ignored){}
+    }
     /** QTag is already on (privileged worker); poll from this process, which does hold a resumed Activity. */
     private void beginComboScan(){
         if(destroyed)return;
@@ -469,7 +574,7 @@ public final class MainActivity extends Activity {
         if(reason!=null&&!terminal){terminal=true;event("QP|RESULT|组合测试："+reason+"；QTag 与前台 ReaderMode 均未产生标签");}
         if(stopFile!=null)try{stopFile.createNewFile();}catch(Exception ignored){}
     }
-    private void requestStop(String reason){if(!busy)return;try{if(stopFile!=null)stopFile.createNewFile();append(reason+"；等当前通信返回后恢复 NFC，不重发写入。");stop.setEnabled(false);}catch(Exception e){append("停止标记失败："+e);}if(foregroundScan)stopForegroundScan(reason);if(comboStarted)finishCombo(reason);}
+    private void requestStop(String reason){if(!busy)return;try{if(stopFile!=null)stopFile.createNewFile();append(reason+"；等当前通信返回后恢复 NFC，不重发写入。");stop.setEnabled(false);}catch(Exception e){append("停止标记失败："+e);}if(foregroundScan)stopForegroundScan(reason);if(comboStarted)finishCombo(reason);if(phonePanel&&!phoneHit)finishPhonePanel(reason);}
     private void showLicense(){
         StringBuilder body=new StringBuilder("参考 https://gitee.com/kur0neko/huawei-epd-pn532\n固定提交 5d3acf730a988815b637262fd4862c1794ab079e\nRequired Notice: Copyright (c) 2026 kur0neko\n\n");
         try(BufferedReader in=new BufferedReader(new InputStreamReader(getAssets().open("licenses/kur0neko-LICENSE.txt"),"UTF-8"))){String line;while((line=in.readLine())!=null)body.append(line).append('\n');}catch(Exception e){body.append(e);}
