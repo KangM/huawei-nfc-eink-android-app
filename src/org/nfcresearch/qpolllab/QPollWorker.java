@@ -30,6 +30,8 @@ public final class QPollWorker {
     private static final AtomicBoolean tagSeen = new AtomicBoolean();
     private static volatile boolean readerTouched, qtagTouched, readerReleased, qtagDisabled;
     private static volatile Method readerMethod;
+    private static volatile Method vendorMethod;
+    private static volatile boolean vendorResolved;
     private static int discoveredCode, lostCode = -1;
     private static Process logcat;
     private static volatile Tag detectedTag;
@@ -128,11 +130,66 @@ public final class QPollWorker {
     private static int qtag(int action) throws Exception {
         return qtagRaw(new byte[]{0x31, (byte) action});
     }
+    /** The vendor NCI channel is not guaranteed to exist. Some builds strip the @SystemApi method
+     *  outright, and then every QTag call fails at reflection time -- before a single byte is sent.
+     *  Probe once, cache, and report the finding instead of throwing a bare NoSuchMethodException. */
+    private static synchronized Method resolveVendorNci() {
+        if (vendorResolved) return vendorMethod;
+        vendorResolved = true;
+        try {
+            vendorMethod = adapterType.getMethod("sendVendorNciMessage",
+                    int.class, int.class, int.class, byte[].class);
+            emit("VENDOR_API", "sendVendorNciMessage(int,int,int,byte[]) · 厂商 NCI 通道存在");
+            return vendorMethod;
+        } catch (NoSuchMethodException shipping) { /* fall through to the other shapes */ }
+        for (Method candidate : adapterType.getMethods()) {
+            if (!candidate.getName().equals("sendVendorNciMessage")) continue;
+            Class<?>[] types = candidate.getParameterTypes();
+            boolean fits = (types.length == 4 && types[0] == int.class && types[1] == int.class
+                    && types[2] == int.class && types[3] == byte[].class)
+                    || (types.length == 3 && types[0] == int.class && types[1] == int.class
+                    && types[2] == byte[].class);
+            if (!fits) continue;
+            vendorMethod = candidate;
+            emit("VENDOR_API", "sendVendorNciMessage(" + types.length + "参) · 非标准签名，按兼容路径调用");
+            return vendorMethod;
+        }
+        emit("VENDOR_API", "本机框架不提供 sendVendorNciMessage · 厂商 NCI 通道不可用");
+        emit("VENDOR_API", "同类入口候选=" + vendorCandidates());
+        return null;
+    }
+    /** Whatever vendor-ish method names the framework does expose, so the report is actionable. */
+    private static String vendorCandidates() {
+        StringBuilder out = new StringBuilder();
+        try {
+            for (Method m : adapterType.getMethods()) {
+                String name = m.getName().toLowerCase(java.util.Locale.ROOT);
+                if (!(name.contains("nci") || name.contains("vendor"))) continue;
+                if (out.length() > 0) out.append("；");
+                out.append(m.getName()).append('/').append(m.getParameterTypes().length);
+                if (out.length() > 220) break;
+            }
+        } catch (Throwable ignored) { }
+        return out.length() == 0 ? "无" : out.toString();
+    }
+    private static final class VendorUnavailable extends Exception {
+        VendorUnavailable(String message) { super(message); }
+    }
     /** Vendor RF channel: MT=1, GID=0x0F (proprietary), OID=0x70. The binder return value is only a
      *  host-side status; the controller's real answer comes back as a 4F70 packet in the HAL log. */
     private static int qtagRaw(byte[] payload) throws Exception {
-        return (Integer) invoke("sendVendorNciMessage", new Class<?>[]{int.class,int.class,int.class,byte[].class},
-                1, 15, 112, payload);
+        Method method = resolveVendorNci();
+        if (method == null) throw new VendorUnavailable("本机框架没有 sendVendorNciMessage，厂商 NCI 通道不存在（与权限无关）");
+        Class<?>[] types = method.getParameterTypes();
+        Object[] arguments = types.length == 4
+                ? new Object[]{1, 15, 112, payload}
+                : new Object[]{15, 112, payload};
+        try { return (Integer) method.invoke(service, arguments); }
+        catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw e;
+        }
     }
     private static String nciStatusText(String status) {
         switch (status) {
@@ -162,7 +219,7 @@ public final class QPollWorker {
         for (int i = 0; i < QTAG_VARIANTS.length; i++) {
             emit("QTAG_TRY", "候选 " + (i + 1) + "/" + QTAG_VARIANTS.length + " · " + QTAG_VARIANTS[i][0]
                     + "（" + QTAG_VARIANTS[i][1] + "）");
-            try { qtagRaw(parseHex(QTAG_VARIANTS[i][0])); }
+            try { qtagRaw(parseHex(QTAG_VARIANTS[i][0])); qtagTouched = true; }
             catch (Exception e) { emit("QTAG_TRY_FAIL", QTAG_VARIANTS[i][0] + " 发送失败：" + e); }
             SystemClock.sleep(400);
         }
@@ -280,19 +337,26 @@ public final class QPollWorker {
                 init();
                 if (args[0].equals("inspect")) {
                     emit("CHIP",ChipInfo.inspect());
-                    adapterType.getMethod("sendVendorNciMessage", int.class, int.class, int.class, byte[].class);
-                    emit("READY", "NXP 测试入口存在，可开始测试（尚未验证空口能力）");
+                    boolean vendor = resolveVendorNci() != null;
+                    emit("READY", vendor
+                            ? "NXP 测试入口存在，可开始测试（尚未验证空口能力）"
+                            : "本机框架没有厂商 NCI 入口；QTag / Q-Poll 测试不可能成功，且与权限无关");
                     for (String line : CapabilityReport.lines()) emit("SYSTEM", line);
                     emit("END", "权限检查完成，未发送寻卡命令"); return;
                 }
                 if (stopFile.exists()) { emit("END", "已取消，未启动寻卡"); return; }
+                // Every mode below injects the NXP proprietary command; stop here when the framework
+                // has no such channel, so the log says why instead of dying on a reflection error.
+                if (!mode.equals("standard") && resolveVendorNci() == null) {
+                    emit("QTAG_UNAVAILABLE", "本机框架不提供 sendVendorNciMessage；未发送任何报文，未改动 NFC 状态");
+                    emit("END", "QTag 类模式无法开始：缺少厂商 NCI 通道"); return;
+                }
                 setupCallback();
                 Runtime.getRuntime().addShutdownHook(new Thread(QPollWorker::cleanup));
                 startLogcat();
                 if (args[0].equals("qtag-sweep")) {
                     emit("START", "qtag-sweep:" + seconds);
                     sessionStarted = true;
-                    qtagTouched = true;
                     sweepQtag();
                     return;
                 }
@@ -300,8 +364,8 @@ public final class QPollWorker {
                 // foreground. This process never calls setReaderMode() -- the framework drops it for
                 // UID 2000 callers without a foreground Activity, so doing it here is pointless.
                 if (args[0].equals("qtag-hold")) {
-                    qtagTouched = true;
                     int status = qtag(1);
+                    qtagTouched = true;
                     emit("QTAG_ON", "启用 QTag（驻留模式），API 状态=" + status + "（只是主机状态）");
                     if (status != 0) throw new IllegalStateException("QTag 启用失败");
                     sessionStarted = true;
@@ -317,8 +381,8 @@ public final class QPollWorker {
                     return;
                 }
                 if (args[0].equals("qtag")||panelOperation) {
-                    qtagTouched = true;
                     int status = qtag(1);
+                    qtagTouched = true;
                     emit("QTAG_ON", "启用 QTag，API 状态=" + status + "（只是主机状态）");
                     if (status != 0) throw new IllegalStateException("QTag 启用失败");
                 }

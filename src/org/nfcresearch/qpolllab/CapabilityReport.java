@@ -32,9 +32,31 @@ public final class CapabilityReport {
         List<String> out = new ArrayList<>();
         out.add("机型=" + Build.MANUFACTURER + " " + Build.MODEL + "（" + Build.DEVICE + "）；Android "
                 + Build.VERSION.RELEASE + " / SDK " + Build.VERSION.SDK_INT);
+        out.add("厂商 NCI 入口=" + vendorNci());
         out.add("NFC 入口=" + entryPoints());
         out.add("配置关键字=" + configHits());
         return out;
+    }
+
+    /** The one method Q-Poll injection depends on. Some OEM builds strip it entirely, and then no
+     *  amount of permission helps -- which is a different verdict from "controller rejected it". */
+    private static String vendorNci() {
+        StringBuilder found = new StringBuilder();
+        for (String type : new String[]{"android.nfc.INfcAdapter", "android.nfc.NfcAdapter"}) {
+            Class<?> clazz;
+            try { clazz = Class.forName(type); } catch (Throwable e) { continue; }
+            try {
+                for (Method m : clazz.getMethods()) {
+                    if (!m.getName().equals("sendVendorNciMessage")) continue;
+                    if (found.length() > 0) found.append("；");
+                    found.append(clazz.getSimpleName()).append(".sendVendorNciMessage/")
+                            .append(m.getParameterTypes().length).append("参");
+                }
+            } catch (Throwable ignored) { }
+        }
+        return found.length() == 0
+                ? "不存在 sendVendorNciMessage —— 本机无法注入 Q-Poll，且与权限无关"
+                : found.toString();
     }
 
     /** Reader / vendor methods the framework actually offers, so we know what can be reflected on. */
