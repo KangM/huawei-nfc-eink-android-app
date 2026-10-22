@@ -363,6 +363,45 @@ QTAG_TRY  · 候选 7/7 · 31        → 4F700105
 
 这一项纯读、零风险，可以在任何状态下点。
 
+### 2026-10-22 能力报告实测：realme RMX3888 上没有这项功能，手机方案结案
+
+实机回传三行：
+
+```
+SYSTEM · 机型=realme RMX3888（RE5C37）；Android 15 / SDK 35
+SYSTEM · NFC 入口=INfcAdapter.enableReaderOption(1参)；INfcAdapter.getNfcAdapterVendorInterface(1参)；
+         INfcAdapter.isReaderOptionEnabled(0参)；INfcAdapter.isReaderOptionSupported(0参)；
+         INfcAdapter.registerVendorExtensionCallback(1参)；INfcAdapter.sendVendorNciMessage(4参)；
+         INfcAdapter.setReaderMode(4参)；INfcAdapter.updateDiscoveryTechnology(3参)；
+         NfcAdapter.enableReaderMode(4参)；NfcAdapter.enableReaderOption(1参)；
+         NfcAdapter.registerNfcVendorNciCallback(2参)；NfcAdapter.resetDiscoveryTechnology(1参)；
+         NfcAdapter.sendVendorNciMessage(4参)；NfcAdapter.setDiscoveryTechnology(3参)；……
+SYSTEM · 配置关键字=已扫描 1 个 libnfc 配置，未出现 QPOLL / EPD / EINK 等关键字
+```
+
+**结论：这台机器没有 Q-Poll，手机侧方案正式结案。** 三条证据各自独立、方向一致：
+
+1. **配置层**：唯一一个 `libnfc*.conf` 里没有任何 e-ink / Q-Poll 相关配置项。
+2. **命令层**：厂商命令 `(GID 0x0F, OID 0x70)` 的 7 种编码全部 `4F 70 01 05`，连单字节 `31` 也一样 —— 固件里没有这条命令的处理分支。
+3. **空口层**：前台 ReaderMode 一次就能拿到普通卡（`ATQA=0400`、`SAK=0008`，MIFARE Classic），链路、线圈、控制器都是好的。
+
+差的只有「发出 7 位短帧 `7A` / `7D`」这一件事，而 **NCI 协议里没有位级短帧原语** —— 这是协议层的硬边界，不是权限、不是型号白名单、也不是编码问题。所以报告里那几个看起来像「新机会」的入口都救不了这条路径：
+
+| 入口 | 实际能做什么 | 为什么不够 |
+|---|---|---|
+| `setDiscoveryTechnology` / `resetDiscoveryTechnology` | 整体接管 / 恢复发现流程，可完全关掉轮询 | 关掉轮询 ≠ 能发出 `7A`；短帧仍需协议支持 |
+| `getNfcAdapterVendorInterface` | 拿到 NXP HAL 厂商接口，可读固件版本、可 `doAction` | 最终还是拼 NCI 报文，同样没有位级帧 |
+| `enableReaderOption` / `isReaderOptionSupported` | realme 自己加的（AOSP 没有），用于息屏 / 后台保持寻卡 | 与唤醒码无关 |
+| `sendVendorNciMessage` | 唯一的厂商命令通道 | 已实测被固件拒绝 |
+
+**手机端若还要能用，只剩「外挂读卡器」一条路**（USB-OTG 接 PN532 或 Chameleon Ultra）。但在此之前先看清真正的墙：
+
+- PC + PN532 已经能发 `7A`、能传完 53/53 帧，却在 `D4` 刷新时 `68CA`（低电压）。
+- 加大 `--precharge-ms`、降低 `--de-hz`、延后首次 `DE` 查询都无效 ⇒ 是**场强 / 耦合**不足，不是时序。
+- 而且早先一次 `send-test` 未带 `--use-stored-driver`，板内 `DA`/`DB` 已被写成上游通用驱动，**原厂驱动不可恢复**。
+
+也就是说：把 PN532 挂到手机上，也只能做到「唤醒 + 传图」，刷新照样 `68CA`。**刷新才是当前唯一的真瓶颈，优先级高于「App 怎么发 7A」。**
+
 ## GitHub Actions 自动构建
 
 仓库里有 `.github/workflows/build-apk.yml`，不需要 Gradle —— 流水线就是「装 JDK + 补齐 build-tools → `python3 build.py`」。
